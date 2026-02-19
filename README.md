@@ -276,7 +276,7 @@ Key optimizations:
 ## Installation
 
 ```bash
-git clone https://github.com/franperezlopez/astroworld.git
+git clone https://github.com/salinas2000/astroworld.git
 cd astroworld
 
 # Install with uv (recommended)
