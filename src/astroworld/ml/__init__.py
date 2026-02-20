@@ -14,6 +14,8 @@ Modules:
   - spectral_model: SSTF network (5-channel, cross-attention, dual heads)
   - spectral_dataset: Multi-survey dataset for spectral cubes
   - spectral_inference: Spectral searcher with MC Dropout + Planck filter
+  - kinematics: Kinematic validation for candidate detections
+  - pipeline: Observatory Pipeline (cascading multi-stage P9 detector)
 """
 
 try:
@@ -48,6 +50,16 @@ if HAS_TORCH:
         SpectralSearcher,
         SpectralSearchResult,
     )
+    from astroworld.ml.kinematics import (
+        filter_detections_kinematic,
+        is_kinematically_valid,
+    )
+    from astroworld.ml.pipeline import (
+        ObservatoryPipeline,
+        PipelineConfig,
+        FieldResult,
+        ObservatorySummary,
+    )
 
 __all__ = [
     "HAS_TORCH",
@@ -77,4 +89,12 @@ __all__ = [
     "MultiSurveyDataset",
     "SpectralSearcher",
     "SpectralSearchResult",
+    # Kinematics (Phase 13)
+    "filter_detections_kinematic",
+    "is_kinematically_valid",
+    # Pipeline (Phase 14)
+    "ObservatoryPipeline",
+    "PipelineConfig",
+    "FieldResult",
+    "ObservatorySummary",
 ]
