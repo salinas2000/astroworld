@@ -8,6 +8,8 @@ Modules:
   - psf_extraction: Extract empirical PSF from stars in FITS images
   - synthetic_injection: Inject synthetic point sources into FITS images
   - training_generator: Batch generate labeled training data for ML
+  - ephemeris: JPL Horizons sky-plane ephemeris (RA, Dec, magnitude)
+  - reprojection: Multi-telescope WCS alignment
 """
 
 from astroworld.imaging.sky_position import (
@@ -43,6 +45,20 @@ from astroworld.imaging.training_generator import (
     generate_multi_epoch_pair,
     TrainingExample,
 )
+from astroworld.imaging.ephemeris import (
+    fetch_sky_ephemeris,
+    fetch_sedna_position,
+    compute_inter_epoch_motion,
+)
+
+# Reprojection requires the optional 'reproject' package
+try:
+    from astroworld.imaging.reprojection import (
+        reproject_to_common_frame,
+        build_common_wcs,
+    )
+except ImportError:
+    pass
 
 __all__ = [
     # Sky position
@@ -72,4 +88,11 @@ __all__ = [
     "generate_single_example",
     "generate_multi_epoch_pair",
     "TrainingExample",
+    # Ephemeris
+    "fetch_sky_ephemeris",
+    "fetch_sedna_position",
+    "compute_inter_epoch_motion",
+    # Reprojection (optional)
+    "reproject_to_common_frame",
+    "build_common_wcs",
 ]
