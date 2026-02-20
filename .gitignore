@@ -15,6 +15,7 @@ build/
 dist/
 output/
 data/survey_images/
+data/training/
 *.fits
 uv.lock
 .claude/

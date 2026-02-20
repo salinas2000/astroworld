@@ -11,10 +11,13 @@ dependencies = [
     "astroquery>=0.4.7",
     "astropy>=6.0",
     "numba>=0.64.0",
+    "photutils>=2.3.0",
+    "scipy>=1.17.0",
 ]
 
 [project.optional-dependencies]
 jit = ["numba>=0.63"]
+imaging = ["photutils>=1.10", "scipy>=1.12"]
 
 [dependency-groups]
 dev = [
