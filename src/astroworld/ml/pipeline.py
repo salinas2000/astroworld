@@ -32,7 +32,11 @@ import numpy as np
 import pandas as pd
 
 from astroworld.imaging.fits_store import load_fits_image
-from astroworld.imaging.spectral_cube import build_spectral_cube
+from astroworld.imaging.spectral_cube import (
+    BAND_W1,
+    BAND_W2,
+    build_spectral_cube,
+)
 from astroworld.imaging.survey_download import download_field
 from astroworld.ml.inference import (
     P9Searcher,
@@ -91,6 +95,7 @@ class PipelineConfig:
     planck_classes_keep: list[str] = field(
         default_factory=lambda: ["p9_candidate", "cold_object"]
     )
+    ir_min_valid_fraction: float = 0.90  # Per-patch: reject if <90% IR pixels > 0
 
     # --- Stage 4: Kinematic filter ---
     kinematic_enabled: bool = True
@@ -564,20 +569,60 @@ class ObservatoryPipeline:
                 }
             )
 
-        # Planck filter: keep only desired classes
+        # ---- Per-patch IR quality filter --------------------------------
+        # Even when a WISE image exists for the whole field, the patch's
+        # 64×64 region may fall on a tile boundary filled with zeros.
+        # Check that at least ``ir_min_valid_fraction`` of the patch's
+        # W1/W2 pixels are non-zero before trusting the temperature head.
+        ps = self.config.patch_size
+        _, cube_h, cube_w = cube1.shape
+        min_frac = self.config.ir_min_valid_fraction
+        n_rejected_patch = 0
+
+        for c in enriched:
+            # Determine the patch bounding box (same layout as searcher)
+            cx, cy = c["pixel_x"], c["pixel_y"]
+            y0 = max(int(cy - ps / 2), 0)
+            x0 = max(int(cx - ps / 2), 0)
+            y1 = min(y0 + ps, cube_h)
+            x1 = min(x0 + ps, cube_w)
+
+            w1_patch = cube1[BAND_W1, y0:y1, x0:x1]
+            w2_patch = cube1[BAND_W2, y0:y1, x0:x1]
+            n_pixels = max(w1_patch.size, 1)
+
+            w1_valid = float(np.count_nonzero(w1_patch)) / n_pixels
+            w2_valid = float(np.count_nonzero(w2_patch)) / n_pixels
+
+            # Both bands must meet the coverage threshold
+            if w1_valid < min_frac and w2_valid < min_frac:
+                c["ir_quality"] = "insufficient_ir_patch"
+                n_rejected_patch += 1
+            elif w1_valid < min_frac or w2_valid < min_frac:
+                c["ir_quality"] = "partial_patch"
+            else:
+                c["ir_quality"] = "full"
+
+        if n_rejected_patch > 0 and self.config.verbose:
+            print(
+                f"    [IR patch filter] {n_rejected_patch}/{len(enriched)} "
+                f"patches rejected (<{min_frac:.0%} valid IR pixels)"
+            )
+
+        # ---- Planck filter: keep only desired classes -------------------
         filtered = [
             c
             for c in enriched
-            if c["planck_class"] in self.config.planck_classes_keep
+            if (
+                c["planck_class"] in self.config.planck_classes_keep
+                and c.get("ir_quality") != "insufficient_ir_patch"
+            )
         ]
 
-        # IR data quality filter: reject candidates when BOTH W1 and W2
-        # are missing (HTTP 404 / failed download).  Without real IR data
-        # the cube's W1/W2 channels are zeros, causing the temperature
-        # head to estimate ~28K (Wien tail of zero flux), producing
-        # false "p9_candidate" classifications.
+        # ---- Field-level IR quality filter (legacy) --------------------
+        # Reject ALL candidates when BOTH W1 and W2 are completely
+        # missing (HTTP 404 / failed download).
         if not (result.has_w1 or result.has_w2):
-            # No IR data at all — all temperature estimates are unreliable
             for c in filtered:
                 c["planck_class"] = "insufficient_ir"
             filtered = []
@@ -587,19 +632,16 @@ class ObservatoryPipeline:
                     f"rejected {len(enriched)} detection(s)"
                 )
         elif not (result.has_w1 and result.has_w2):
-            # Partial IR: only one band.  Temperature estimate is degraded
-            # but still has some signal.  Flag but keep candidates.
+            # Flag partial field-level coverage (1/2 bands available)
             for c in filtered:
-                c["ir_quality"] = "partial"
+                if c.get("ir_quality") == "full":
+                    c["ir_quality"] = "partial"
             if self.config.verbose:
                 n_bands = int(result.has_w1) + int(result.has_w2)
                 print(
                     f"    [IR quality] {n_bands}/2 WISE bands — "
                     f"partial IR coverage"
                 )
-        else:
-            for c in filtered:
-                c["ir_quality"] = "full"
 
         result.stage3_detections = len(spectral_result.patch_detections)
         result.stage3_candidates = filtered

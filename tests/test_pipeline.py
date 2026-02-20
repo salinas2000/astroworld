@@ -70,12 +70,22 @@ def _write_synthetic_fits(
     ny: int = 64,
     ra: float = 180.0,
     dec: float = 30.0,
+    fill_zeros: bool = False,
 ) -> None:
-    """Write a minimal synthetic FITS file for testing."""
+    """Write a minimal synthetic FITS file for testing.
+
+    Parameters
+    ----------
+    fill_zeros : bool
+        If True, write all-zero data (simulates HTTP 404 / empty tile).
+    """
     from astropy.io import fits
 
-    rng = np.random.default_rng(42)
-    data = rng.normal(100, 10, size=(ny, nx)).astype(np.float32)
+    if fill_zeros:
+        data = np.zeros((ny, nx), dtype=np.float32)
+    else:
+        rng = np.random.default_rng(42)
+        data = rng.normal(100, 10, size=(ny, nx)).astype(np.float32)
     hdu = fits.PrimaryHDU(data)
     hdr = hdu.header
     hdr["NAXIS1"] = nx
@@ -146,6 +156,7 @@ class TestPipelineConfig:
         assert cfg.overlap == 8
         assert cfg.kinematic_enabled is True
         assert cfg.device == "auto"
+        assert cfg.ir_min_valid_fraction == 0.90
 
     def test_custom_thresholds(self):
         """Custom thresholds are stored correctly."""
@@ -510,10 +521,149 @@ class TestStage3Spectral:
         )
         result = pipeline._stage3_spectral(result)
 
-        # Candidates should be kept but flagged as partial
+        # Candidates should be kept but flagged as partial.
+        # Per-patch filter may label as "partial_patch" (only W1 in patch),
+        # and field-level filter then upgrades to "partial" for remaining.
+        # Accept either partial variant.
         for c in result.stage3_candidates:
             if "ir_quality" in c:
-                assert c["ir_quality"] == "partial"
+                assert c["ir_quality"] in ("partial", "partial_patch")
+
+    def test_ir_patch_filter_zero_tiles(self, tmp_path):
+        """Per-patch IR filter rejects detections when patch IR pixels are zeros.
+
+        Simulates WISE tile-boundary artifact: field has W1/W2 files (has_w1=True,
+        has_w2=True), but the actual FITS data is all zeros — the 64×64 patch
+        region has <90% valid pixels, so candidates are rejected.
+        """
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+            FieldResult,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.01, mc_samples=1, device="cpu",  # very low thresh
+        )
+        config = PipelineConfig(
+            data_dir=tmp_path, download_pixels=64, verbose=False,
+            ir_min_valid_fraction=0.90,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        # Optical = real data, W1/W2 = all zeros (tile boundary)
+        optical_path = tmp_path / "dss2_red" / "test.fits"
+        w1_path = tmp_path / "wise_3.4" / "test.fits"
+        w2_path = tmp_path / "wise_4.6" / "test.fits"
+        _write_synthetic_fits(optical_path, nx=64, ny=64)
+        _write_synthetic_fits(w1_path, nx=64, ny=64, fill_zeros=True)
+        _write_synthetic_fits(w2_path, nx=64, ny=64, fill_zeros=True)
+
+        result = FieldResult(
+            field_id="test", ra_deg=180.0, dec_deg=30.0,
+            optical_path=str(optical_path),
+            w1_path=str(w1_path),
+            w2_path=str(w2_path),
+            has_w1=True,  # File exists but data is zeros
+            has_w2=True,
+        )
+        result = pipeline._stage3_spectral(result)
+
+        # ALL candidates should be rejected: patch IR pixels are zeros
+        assert len(result.stage3_candidates) == 0
+
+    def test_ir_patch_filter_valid_data_passes(self, tmp_path):
+        """Per-patch IR filter keeps detections when patch has real IR pixels."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+            FieldResult,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.01, mc_samples=1, device="cpu",  # very low thresh
+        )
+        config = PipelineConfig(
+            data_dir=tmp_path, download_pixels=64, verbose=False,
+            ir_min_valid_fraction=0.90,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        # All bands have real data
+        optical_path = tmp_path / "dss2_red" / "test.fits"
+        w1_path = tmp_path / "wise_3.4" / "test.fits"
+        w2_path = tmp_path / "wise_4.6" / "test.fits"
+        _write_synthetic_fits(optical_path, nx=64, ny=64)
+        _write_synthetic_fits(w1_path, nx=64, ny=64)  # Real data
+        _write_synthetic_fits(w2_path, nx=64, ny=64)  # Real data
+
+        result = FieldResult(
+            field_id="test", ra_deg=180.0, dec_deg=30.0,
+            optical_path=str(optical_path),
+            w1_path=str(w1_path),
+            w2_path=str(w2_path),
+            has_w1=True,
+            has_w2=True,
+        )
+        result = pipeline._stage3_spectral(result)
+
+        # With real IR data, candidates should survive the patch filter
+        # (they pass with ir_quality="full")
+        for c in result.stage3_candidates:
+            assert c.get("ir_quality") == "full"
+
+    def test_ir_patch_filter_config_threshold(self, tmp_path):
+        """ir_min_valid_fraction=0.0 disables per-patch rejection."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+            FieldResult,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.01, mc_samples=1, device="cpu",
+        )
+        config = PipelineConfig(
+            data_dir=tmp_path, download_pixels=64, verbose=False,
+            ir_min_valid_fraction=0.0,  # Disabled: accept anything
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        # W1/W2 all zeros — but filter is disabled
+        optical_path = tmp_path / "dss2_red" / "test.fits"
+        w1_path = tmp_path / "wise_3.4" / "test.fits"
+        w2_path = tmp_path / "wise_4.6" / "test.fits"
+        _write_synthetic_fits(optical_path, nx=64, ny=64)
+        _write_synthetic_fits(w1_path, nx=64, ny=64, fill_zeros=True)
+        _write_synthetic_fits(w2_path, nx=64, ny=64, fill_zeros=True)
+
+        result = FieldResult(
+            field_id="test", ra_deg=180.0, dec_deg=30.0,
+            optical_path=str(optical_path),
+            w1_path=str(w1_path),
+            w2_path=str(w2_path),
+            has_w1=True,
+            has_w2=True,
+        )
+        result = pipeline._stage3_spectral(result)
+
+        # With threshold=0.0, zero-IR patches should NOT be rejected
+        # (they may still be filtered by Planck class, but not by IR quality)
+        # Verify no candidate has "insufficient_ir_patch"
+        for c in result.stage3_candidates:
+            assert c.get("ir_quality") != "insufficient_ir_patch"
 
 
 # ---------------------------------------------------------------------------
