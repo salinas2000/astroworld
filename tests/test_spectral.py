@@ -670,3 +670,172 @@ class TestNormalizeSpectralCube:
                 f"Channel {ch} mean={norm[ch].mean():.2f}"
             assert 0.5 < norm[ch].std() < 2.0, \
                 f"Channel {ch} std={norm[ch].std():.2f}"
+
+
+# ===========================================================================
+# Tests: Spectral Training Data Generator
+# ===========================================================================
+
+class TestSpectralDataGenerator:
+    """Tests for generate_spectral_training_data.py functions."""
+
+    def test_ir_flux_ratio_matches_planck(self):
+        """W1/W2 flux ratio should approximate planck_flux_ratio(T) for warm bodies.
+
+        At very low temperatures (T < 100K), the Planck ratio W1/W2 is
+        effectively zero (both bands are far from the emission peak).
+        We test at temperatures where the ratio is physically meaningful.
+        """
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from generate_spectral_training_data import compute_ir_fluxes
+
+        rng = np.random.default_rng(42)
+
+        # Test at temperatures where Planck ratio is well-defined (> ~200K)
+        for temp in [300.0, 1000.0, 3000.0, 5000.0]:
+            flux_w1, flux_w2 = compute_ir_fluxes(
+                optical_flux=1000.0, temperature_k=temp,
+                ir_boost=5.0, rng=rng, color_noise_frac=0.0,
+            )
+            actual_ratio = flux_w1 / flux_w2 if flux_w2 > 0 else 0
+            expected_ratio = planck_flux_ratio(temp)
+            assert abs(actual_ratio - expected_ratio) < 0.02 * expected_ratio + 1e-6, \
+                f"T={temp}K: ratio {actual_ratio:.4f} != expected {expected_ratio:.4f}"
+
+    def test_color_noise_adds_variation(self):
+        """Color noise produces different ratios across samples.
+
+        Uses T=1000K where the Planck ratio is well-defined (~0.66),
+        so the ±5% noise is visible in the W1/W2 ratio spread.
+        """
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from generate_spectral_training_data import compute_ir_fluxes
+
+        ratios = []
+        for seed in range(20):
+            rng = np.random.default_rng(seed)
+            flux_w1, flux_w2 = compute_ir_fluxes(
+                optical_flux=1000.0, temperature_k=1000.0,
+                ir_boost=5.0, rng=rng, color_noise_frac=0.05,
+            )
+            ratios.append(flux_w1 / flux_w2)
+
+        # With 5% noise at T=1000K (ratio ~0.66), std should be ~0.03
+        assert np.std(ratios) > 0.001, \
+            f"Color noise should produce variation, got std={np.std(ratios):.6f}"
+
+    def test_generate_small_dataset(self):
+        """Generate a small dataset and check catalog schema."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from generate_spectral_training_data import generate_spectral_training_data
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = generate_spectral_training_data(
+                output_dir=Path(tmpdir),
+                n_positive=5, n_negative=5,
+                img_size=32, seed=42,
+            )
+
+            # Check catalog columns
+            required_cols = [
+                "example_id", "optical_path", "w1_path", "w2_path",
+                "source_present", "temp_kelvin", "epoch_jd", "delta_t_days",
+            ]
+            for col in required_cols:
+                assert col in catalog.columns, f"Missing column: {col}"
+
+            # Should have 20 rows (5 pos + 5 neg) * 2 epochs
+            assert len(catalog) == 20
+
+            # Check FITS files exist
+            for _, row in catalog.iterrows():
+                opt_path = Path(tmpdir) / row["optical_path"]
+                assert opt_path.exists(), f"Missing: {opt_path}"
+                w1_path = Path(tmpdir) / row["w1_path"]
+                assert w1_path.exists(), f"Missing: {w1_path}"
+
+            # Positive rows have valid temperature
+            pos = catalog[catalog["source_present"] == True]
+            assert pos["temp_kelvin"].notna().all()
+
+            # Negative rows have NaN temperature
+            neg = catalog[catalog["source_present"] == False]
+            assert neg["temp_kelvin"].isna().all()
+
+    def test_fits_image_shape(self):
+        """Generated FITS files have correct shape."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from generate_spectral_training_data import generate_spectral_training_data
+        from astropy.io import fits as test_fits
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = generate_spectral_training_data(
+                output_dir=Path(tmpdir),
+                n_positive=2, n_negative=1,
+                img_size=48, seed=99,
+            )
+
+            # Check first positive optical file
+            first_opt = Path(tmpdir) / catalog.iloc[0]["optical_path"]
+            with test_fits.open(str(first_opt)) as hdu:
+                data = hdu[0].data.copy()  # Copy data before closing
+            assert data.shape == (48, 48)
+
+
+@requires_torch
+class TestCheckpointArchParams:
+    """Tests for architecture parameter storage in checkpoints."""
+
+    def test_checkpoint_stores_arch_params(self):
+        """Checkpoint contains feature_dim, num_heads, dropout."""
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+        from astroworld.ml.trainer import TrainingConfig
+
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        from train_spectral import SpectralTrainer
+
+        model = SpectralSiameseNet(feature_dim=128, num_heads=2, dropout=0.3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TrainingConfig(
+                epochs=1, device="cpu", checkpoint_dir=tmpdir,
+            )
+            trainer = SpectralTrainer(model, config)
+            optimizer = torch.optim.Adam(model.parameters())
+
+            ckpt_path = trainer._save_checkpoint(1, 0.5, optimizer)
+
+            ckpt = torch.load(ckpt_path, weights_only=True)
+            assert ckpt["feature_dim"] == 128
+            assert ckpt["num_heads"] == 2
+            assert abs(ckpt["dropout"] - 0.3) < 1e-6
+
+    def test_from_checkpoint_reads_arch_params(self):
+        """from_checkpoint() uses architecture params from checkpoint."""
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+        from astroworld.ml.spectral_inference import SpectralSearcher
+
+        model = SpectralSiameseNet(feature_dim=128, num_heads=2, dropout=0.3)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "model_type": "SpectralSiameseNet",
+                "feature_dim": 128,
+                "num_heads": 2,
+                "dropout": 0.3,
+            }, f.name)
+
+            # Load without specifying model_kwargs — should use checkpoint values
+            searcher = SpectralSearcher.from_checkpoint(
+                f.name, patch_size=32, overlap=0,
+                threshold=0.5, mc_samples=1, device="cpu",
+            )
+
+            # Verify model was built with correct params
+            assert searcher.model.encoder.feature_dim == 128

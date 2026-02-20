@@ -93,6 +93,11 @@ class MultiSurveyDataset(Dataset):
     indices : Subset of pair indices (for train/val split)
     use_cache : Load cached cubes from disk if available
     cache_dir : Directory for cube cache files
+    direct_stack : If True, load FITS files and stack them directly
+        as (5, H, W) without WCS reprojection.  Use this for synthetic
+        training data where all bands share the same pixel grid.
+        If False (default), uses ``build_spectral_cube()`` with full
+        WCS reprojection — required for real survey data (WISE vs DSS2).
     """
 
     def __init__(
@@ -103,6 +108,7 @@ class MultiSurveyDataset(Dataset):
         indices: np.ndarray | None = None,
         use_cache: bool = True,
         cache_dir: Path | str = Path("data/spectral_cache"),
+        direct_stack: bool = False,
     ):
         self.catalog_path = Path(catalog_path)
         self.catalog = pd.read_csv(self.catalog_path)
@@ -111,6 +117,7 @@ class MultiSurveyDataset(Dataset):
         self.augment = augment
         self.use_cache = use_cache
         self.cache_dir = Path(cache_dir)
+        self.direct_stack = direct_stack
         self._rng = np.random.default_rng()
 
         # Group pairs by prefix
@@ -191,10 +198,17 @@ class MultiSurveyDataset(Dataset):
     def _load_cube(self, row: pd.Series) -> np.ndarray:
         """Load or build a spectral cube for one epoch.
 
-        Tries to load from cache first.  If not cached, builds from
-        individual FITS files (optical + W1 + W2).
+        In ``direct_stack`` mode, simply loads FITS files and stacks them
+        as channels — fast, no WCS reprojection.  Use for synthetic data
+        where all bands share the same pixel grid.
+
+        In normal mode, uses ``build_spectral_cube()`` with full WCS
+        reprojection (required for real survey data with different scales).
         """
-        # Load optical image
+        if self.direct_stack:
+            return self._load_cube_direct(row)
+
+        # Full WCS reprojection mode (real survey data)
         optical_path = self._resolve_path(row["optical_path"])
         optical_image, optical_header = load_fits_image(optical_path)
 
@@ -236,6 +250,52 @@ class MultiSurveyDataset(Dataset):
                 target_shape=target_shape,
             )
 
+        return cube
+
+    def _load_cube_direct(self, row: pd.Series) -> np.ndarray:
+        """Load FITS files and stack directly as channels (no WCS).
+
+        For synthetic training data where all bands share the same pixel
+        grid.  Channels C3 (uncertainty) and C4 (temporal) are left as
+        zeros — C4 is filled later from the epoch pair.
+
+        Returns
+        -------
+        (5, H, W) float32 array
+        """
+        # Load optical image (required)
+        optical_path = self._resolve_path(row["optical_path"])
+        optical_image, _ = load_fits_image(optical_path)
+        h, w = optical_image.shape
+
+        cube = np.zeros((NUM_CHANNELS, h, w), dtype=np.float32)
+        cube[0] = optical_image.astype(np.float32)
+
+        # Load W1 if available
+        w1_path_str = row.get("w1_path", "")
+        if pd.notna(w1_path_str) and str(w1_path_str).strip():
+            try:
+                w1_path = self._resolve_path(str(w1_path_str))
+                w1_img, _ = load_fits_image(w1_path)
+                # Crop/pad to match optical shape
+                ch, cw = min(h, w1_img.shape[0]), min(w, w1_img.shape[1])
+                cube[1, :ch, :cw] = w1_img[:ch, :cw].astype(np.float32)
+            except Exception:
+                pass
+
+        # Load W2 if available
+        w2_path_str = row.get("w2_path", "")
+        if pd.notna(w2_path_str) and str(w2_path_str).strip():
+            try:
+                w2_path = self._resolve_path(str(w2_path_str))
+                w2_img, _ = load_fits_image(w2_path)
+                ch, cw = min(h, w2_img.shape[0]), min(w, w2_img.shape[1])
+                cube[2, :ch, :cw] = w2_img[:ch, :cw].astype(np.float32)
+            except Exception:
+                pass
+
+        # C3 (uncertainty) = zeros for synthetic data
+        # C4 (temporal) = zeros, filled by __getitem__ from epoch pair
         return cube
 
     def _resolve_path(self, path_str: str) -> Path:

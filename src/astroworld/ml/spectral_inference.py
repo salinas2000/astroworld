@@ -108,11 +108,16 @@ class SpectralSearcher:
     ) -> "SpectralSearcher":
         """Load SpectralSiameseNet from checkpoint and create searcher.
 
+        Architecture parameters (feature_dim, num_heads, dropout) are
+        automatically read from the checkpoint if available (saved by
+        SpectralTrainer).  Explicit ``model_kwargs`` override checkpoint
+        values for backward compatibility.
+
         Parameters
         ----------
         checkpoint_path : Path to ``best_model.pt``
         model_kwargs : Passed to SpectralSiameseNet constructor
-            (feature_dim, num_heads, dropout)
+            (feature_dim, num_heads, dropout).  Overrides checkpoint values.
         """
         checkpoint_path = Path(checkpoint_path)
         searcher_device = cls._select_device_static(device)
@@ -120,6 +125,11 @@ class SpectralSearcher:
         checkpoint = torch.load(
             checkpoint_path, map_location=searcher_device, weights_only=True
         )
+
+        # Extract architecture params from checkpoint (backward compatible)
+        for key in ("feature_dim", "num_heads", "dropout"):
+            if key in checkpoint and key not in model_kwargs:
+                model_kwargs[key] = checkpoint[key]
 
         model = SpectralSiameseNet(**model_kwargs)
         model.load_state_dict(checkpoint["model_state_dict"])

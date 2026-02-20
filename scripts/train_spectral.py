@@ -353,6 +353,10 @@ class SpectralTrainer:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": val_loss,
                 "model_type": "SpectralSiameseNet",
+                # Architecture params for checkpoint portability
+                "feature_dim": self.model.encoder.feature_dim,
+                "num_heads": self.model.cross_attn.cross_attn_1to2.num_heads,
+                "dropout": self.model._dropout_rate,
             },
             path,
         )
@@ -385,6 +389,9 @@ def main():
     parser.add_argument("--feature-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--direct-stack", action="store_true",
+                        help="Load FITS directly (skip WCS reprojection) "
+                             "for synthetic training data")
 
     args = parser.parse_args()
 
@@ -416,8 +423,15 @@ def main():
     print(f"\n  Model parameters: {model.num_parameters:,}")
 
     # Build datasets
+    ds_kwargs = dict(
+        do_normalize=True,
+        direct_stack=args.direct_stack,
+    )
+    if args.direct_stack:
+        print(f"  Mode:       direct_stack (skip WCS reprojection)")
+
     full_dataset = MultiSurveyDataset(
-        catalog_path, do_normalize=True, augment=False,
+        catalog_path, augment=False, **ds_kwargs,
     )
     n_total = len(full_dataset)
     n_val = max(1, int(n_total * 0.2))
@@ -430,10 +444,10 @@ def main():
     val_idx = indices[n_train:]
 
     train_dataset = MultiSurveyDataset(
-        catalog_path, do_normalize=True, augment=True, indices=train_idx,
+        catalog_path, augment=True, indices=train_idx, **ds_kwargs,
     )
     val_dataset = MultiSurveyDataset(
-        catalog_path, do_normalize=True, augment=False, indices=val_idx,
+        catalog_path, augment=False, indices=val_idx, **ds_kwargs,
     )
 
     print(f"  Train: {len(train_dataset)} pairs")
