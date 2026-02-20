@@ -119,9 +119,17 @@ def main():
     n_neg = len(catalog) - n_pos
 
     if args.model == "siamese":
-        train_idx_arr, val_idx_arr = split_train_val(
-            catalog, val_fraction=args.val_fraction, seed=args.seed
-        )
+        # For Siamese, split at the PAIR level (not row level)
+        # First build the dataset to count pairs, then split pair indices
+        full_ds = MultiEpochDataset(catalog_path, augment=False)
+        n_pairs = len(full_ds)
+        rng = np.random.default_rng(args.seed)
+        pair_indices = np.arange(n_pairs)
+        rng.shuffle(pair_indices)
+        n_val = max(1, int(n_pairs * args.val_fraction))
+        val_idx_arr = pair_indices[:n_val]
+        train_idx_arr = pair_indices[n_val:]
+
         train_ds = MultiEpochDataset(
             catalog_path, augment=True, indices=train_idx_arr,
         )
@@ -129,7 +137,7 @@ def main():
             catalog_path, augment=False, indices=val_idx_arr,
         )
         print(f"  Data:     {catalog_path}")
-        print(f"  Pairs:    {len(train_ds)} train, {len(val_ds)} val")
+        print(f"  Pairs:    {n_pairs} total -> {len(train_ds)} train, {len(val_ds)} val")
     else:
         train_idx_arr, val_idx_arr = split_train_val(
             catalog, val_fraction=args.val_fraction, seed=args.seed

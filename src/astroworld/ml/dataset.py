@@ -205,10 +205,13 @@ class FITSDataset(Dataset):
         """
         row = self.catalog.iloc[idx]
 
-        # Resolve FITS path (relative to catalog directory)
+        # Resolve FITS path
         fits_path = Path(row["fits_path"])
         if not fits_path.is_absolute():
-            fits_path = self.base_dir / fits_path
+            # Try path as-is first (relative to CWD / project root)
+            if not fits_path.exists():
+                # Fall back to relative to catalog directory
+                fits_path = self.base_dir / fits_path
 
         image, _header = load_fits_image(fits_path)
 
@@ -306,9 +309,11 @@ class MultiEpochDataset(Dataset):
         path1 = Path(row1["fits_path"])
         path2 = Path(row2["fits_path"])
         if not path1.is_absolute():
-            path1 = self.base_dir / path1
+            if not path1.exists():
+                path1 = self.base_dir / path1
         if not path2.is_absolute():
-            path2 = self.base_dir / path2
+            if not path2.exists():
+                path2 = self.base_dir / path2
 
         img1, _ = load_fits_image(path1)
         img2, _ = load_fits_image(path2)
