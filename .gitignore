@@ -19,6 +19,7 @@ data/training/
 checkpoints/
 *.pt
 *.fits
+results/
 uv.lock
 .claude/
 nul
