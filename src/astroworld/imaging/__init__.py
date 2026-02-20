@@ -10,6 +10,7 @@ Modules:
   - training_generator: Batch generate labeled training data for ML
   - ephemeris: JPL Horizons sky-plane ephemeris (RA, Dec, magnitude)
   - reprojection: Multi-telescope WCS alignment
+  - spectral_cube: Multi-survey spectral cube assembly (optical+IR)
 """
 
 from astroworld.imaging.sky_position import (
@@ -60,6 +61,15 @@ try:
 except ImportError:
     pass
 
+from astroworld.imaging.spectral_cube import (
+    build_spectral_cube,
+    build_spectral_cube_cached,
+    compute_uncertainty_map,
+    compute_temporal_gradient,
+    estimate_color_temperature,
+    planck_flux_ratio,
+)
+
 __all__ = [
     # Sky position
     "predict_p9_sky_position",
@@ -95,4 +105,11 @@ __all__ = [
     # Reprojection (optional)
     "reproject_to_common_frame",
     "build_common_wcs",
+    # Spectral cube
+    "build_spectral_cube",
+    "build_spectral_cube_cached",
+    "compute_uncertainty_map",
+    "compute_temporal_gradient",
+    "estimate_color_temperature",
+    "planck_flux_ratio",
 ]

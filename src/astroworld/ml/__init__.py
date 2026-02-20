@@ -11,6 +11,9 @@ Modules:
   - trainer: Training loop, metrics, checkpointing
   - inference: Sliding-window search pipeline (P9Searcher)
   - post_processing: NMS, coordinate conversion, visualization
+  - spectral_model: SSTF network (5-channel, cross-attention, dual heads)
+  - spectral_dataset: Multi-survey dataset for spectral cubes
+  - spectral_inference: Spectral searcher with MC Dropout + Planck filter
 """
 
 try:
@@ -34,6 +37,17 @@ if HAS_TORCH:
         non_maximum_suppression,
         detections_to_candidates,
     )
+    from astroworld.ml.spectral_model import (
+        SpectralEncoder,
+        CrossAttentionFusion,
+        SpectralSiameseNet,
+        PlanckFilter,
+    )
+    from astroworld.ml.spectral_dataset import MultiSurveyDataset
+    from astroworld.ml.spectral_inference import (
+        SpectralSearcher,
+        SpectralSearchResult,
+    )
 
 __all__ = [
     "HAS_TORCH",
@@ -55,4 +69,12 @@ __all__ = [
     # Post-processing
     "non_maximum_suppression",
     "detections_to_candidates",
+    # Spectral (SSTF — Phase 12)
+    "SpectralEncoder",
+    "CrossAttentionFusion",
+    "SpectralSiameseNet",
+    "PlanckFilter",
+    "MultiSurveyDataset",
+    "SpectralSearcher",
+    "SpectralSearchResult",
 ]
