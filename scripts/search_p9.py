@@ -272,7 +272,7 @@ def main():
         print()
 
     if total_candidates == 0 and args.mode == "self-pair":
-        print("  ✓ Zero false positives in self-pair null test")
+        print("  [OK] Zero false positives in self-pair null test")
         print()
 
     # Save summary
