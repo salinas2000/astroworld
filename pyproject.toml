@@ -18,6 +18,9 @@ dependencies = [
 [project.optional-dependencies]
 jit = ["numba>=0.63"]
 imaging = ["photutils>=1.10", "scipy>=1.12"]
+ml = [
+    "torch>=2.0",
+]
 
 [dependency-groups]
 dev = [
@@ -34,4 +37,7 @@ packages = ["src/astroworld"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["slow: tests that take >1 min to run (e.g. Mercury precession)"]
+markers = [
+    "slow: tests that take >1 min to run (e.g. Mercury precession)",
+    "ml: tests requiring PyTorch (torch)",
+]

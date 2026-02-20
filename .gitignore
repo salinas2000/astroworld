@@ -16,6 +16,8 @@ dist/
 output/
 data/survey_images/
 data/training/
+checkpoints/
+*.pt
 *.fits
 uv.lock
 .claude/
