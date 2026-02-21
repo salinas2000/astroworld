@@ -380,8 +380,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Weight for motion loss")
-    parser.add_argument("--beta", type=float, default=0.1,
-                        help="Weight for temperature loss")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="Weight for temperature loss (default 0.5)")
     parser.add_argument("--checkpoint-dir", type=Path,
                         default=Path("checkpoints/spectral"))
     parser.add_argument("--device", type=str, default="auto")

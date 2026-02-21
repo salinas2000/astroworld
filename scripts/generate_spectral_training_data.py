@@ -103,6 +103,56 @@ def inject_source(
 
 
 # ---------------------------------------------------------------------------
+# Temperature sampling profiles
+# ---------------------------------------------------------------------------
+
+# Calibrated profile: 4 physical classes with realistic temperature ranges
+TEMP_CLASSES_CALIBRATED = [
+    # (weight, T_min, T_max, label)
+    (0.40, 15.0, 50.0, "p9_like"),          # Planet 9 / ultra-cold
+    (0.20, 50.0, 200.0, "cold_object"),      # TNOs, comets, ice giants
+    (0.20, 200.0, 2500.0, "brown_dwarf"),    # Brown dwarfs, cool stars
+    (0.20, 2500.0, 10000.0, "warm_source"),  # Stars, warm galaxies
+]
+
+# Confuser classes: hot sources injected as negatives (no motion)
+CONFUSER_CLASSES = [
+    # (weight, T_min, T_max, label)
+    (0.50, 3000.0, 6000.0, "star"),          # Cool to mid-temp stars
+    (0.50, 200.0, 2000.0, "galaxy"),         # Galaxy / warm extended source
+]
+
+
+def _sample_temperature_calibrated(
+    rng: np.random.Generator,
+) -> tuple[float, str]:
+    """Sample a temperature from the calibrated multi-class distribution.
+
+    Returns (temperature_k, class_label).
+    """
+    weights = [c[0] for c in TEMP_CLASSES_CALIBRATED]
+    idx = rng.choice(len(TEMP_CLASSES_CALIBRATED), p=weights)
+    _, t_min, t_max, label = TEMP_CLASSES_CALIBRATED[idx]
+    # Sample in log10 space for better coverage of large range
+    log_t = rng.uniform(np.log10(t_min), np.log10(t_max))
+    return 10.0 ** log_t, label
+
+
+def _sample_confuser_temperature(
+    rng: np.random.Generator,
+) -> tuple[float, str]:
+    """Sample a temperature for a confuser (hot negative with IR signature).
+
+    Returns (temperature_k, class_label).
+    """
+    weights = [c[0] for c in CONFUSER_CLASSES]
+    idx = rng.choice(len(CONFUSER_CLASSES), p=weights)
+    _, t_min, t_max, label = CONFUSER_CLASSES[idx]
+    log_t = rng.uniform(np.log10(t_min), np.log10(t_max))
+    return 10.0 ** log_t, label
+
+
+# ---------------------------------------------------------------------------
 # IR flux computation with Planck physics + color noise
 # ---------------------------------------------------------------------------
 
@@ -202,11 +252,13 @@ def generate_spectral_training_data(
     output_dir: Path,
     n_positive: int = 300,
     n_negative: int = 300,
+    n_confuser: int = 0,
     img_size: int = 64,
     snr_min: float = 3.0,
     snr_max: float = 15.0,
     temp_min: float = 25.0,
     temp_max: float = 60.0,
+    temp_profile: str = "p9_only",
     motion_px: float = 8.0,
     delta_t_days: float = DEFAULT_DELTA_T,
     color_noise_frac: float = 0.05,
@@ -225,12 +277,21 @@ def generate_spectral_training_data(
         Number of positive (source present) pairs.
     n_negative : int
         Number of negative (no source) pairs.
+    n_confuser : int
+        Number of confuser negatives (hot sources without motion).
+        These have ``source_present=False`` but real temperature labels,
+        teaching the temperature head to recognize warm contaminants.
     img_size : int
         Image size in pixels (square).
     snr_min, snr_max : float
         Optical S/N range for injected sources.
     temp_min, temp_max : float
-        Temperature range in Kelvin for blackbody sources.
+        Temperature range in Kelvin (only used with ``temp_profile="p9_only"``).
+    temp_profile : str
+        Temperature sampling mode:
+        ``"p9_only"`` — legacy U(temp_min, temp_max), default 25-60 K.
+        ``"calibrated"`` — multi-class distribution covering 15-10000 K
+        with physically motivated class proportions.
     motion_px : float
         Source displacement between epochs in pixels.
     delta_t_days : float
@@ -247,8 +308,11 @@ def generate_spectral_training_data(
     output_dir = Path(output_dir)
     pos_dir = output_dir / "positive"
     neg_dir = output_dir / "negative"
+    conf_dir = output_dir / "confuser"
     pos_dir.mkdir(parents=True, exist_ok=True)
     neg_dir.mkdir(parents=True, exist_ok=True)
+    if n_confuser > 0:
+        conf_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed)
 
@@ -261,10 +325,13 @@ def generate_spectral_training_data(
     # -------------------------------------------------------------------
     # Positive pairs: source with Planck-consistent IR signature
     # -------------------------------------------------------------------
-    print(f"Generating {n_positive} positive pairs...")
+    print(f"Generating {n_positive} positive pairs (profile={temp_profile})...")
     for i in range(n_positive):
         # Choose physical parameters
-        temperature = rng.uniform(temp_min, temp_max)
+        if temp_profile == "calibrated":
+            temperature, _cls = _sample_temperature_calibrated(rng)
+        else:
+            temperature = rng.uniform(temp_min, temp_max)
         snr = rng.uniform(snr_min, snr_max)
         ir_boost = rng.uniform(2.0, 10.0)
 
@@ -377,6 +444,73 @@ def generate_spectral_training_data(
         if (i + 1) % 100 == 0:
             print(f"  [{i+1}/{n_negative}]")
 
+    # -------------------------------------------------------------------
+    # Confuser negatives: hot sources with IR signature but NO motion
+    # -------------------------------------------------------------------
+    if n_confuser > 0:
+        print(f"Generating {n_confuser} confuser pairs (hot sources, no motion)...")
+        for i in range(n_confuser):
+            # Sample warm/hot temperature
+            temperature, conf_cls = _sample_confuser_temperature(rng)
+            snr = rng.uniform(snr_min, snr_max)
+            ir_boost = rng.uniform(0.5, 3.0)  # Lower boost for warm sources
+
+            # Source position — NO motion (same position both epochs)
+            cx, cy = img_size / 2, img_size / 2
+            px1 = cx + rng.uniform(-5, 5)
+            py1 = cy + rng.uniform(-5, 5)
+            # px2 = px1, py2 = py1  (zero displacement)
+
+            # Optical flux from S/N
+            optical_flux = snr * OPTICAL_BG_STD / optical_psf.max()
+
+            # IR fluxes from Planck law
+            flux_w1, flux_w2 = compute_ir_fluxes(
+                optical_flux, temperature, ir_boost, rng, color_noise_frac,
+            )
+
+            # Generate images — SAME position for both epochs
+            for epoch, (sx, sy) in enumerate([(px1, py1), (px1, py1)], start=1):
+                epoch_tag = f"epoch{epoch}"
+
+                opt_img = rng.normal(
+                    OPTICAL_BG_MEAN, OPTICAL_BG_STD, (img_size, img_size),
+                ).astype(np.float32)
+                opt_img = inject_source(opt_img, sx, sy, optical_flux, optical_psf)
+
+                w1_img = rng.normal(
+                    W1_BG_MEAN, W1_BG_STD, (img_size, img_size),
+                ).astype(np.float32)
+                w1_img = inject_source(w1_img, sx, sy, flux_w1, wise_psf)
+
+                w2_img = rng.normal(
+                    W2_BG_MEAN, W2_BG_STD, (img_size, img_size),
+                ).astype(np.float32)
+                w2_img = inject_source(w2_img, sx, sy, flux_w2, wise_psf)
+
+                opt_path = conf_dir / f"conf_{i:04d}_{epoch_tag}_optical.fits"
+                w1_path = conf_dir / f"conf_{i:04d}_{epoch_tag}_w1.fits"
+                w2_path = conf_dir / f"conf_{i:04d}_{epoch_tag}_w2.fits"
+
+                save_fits(opt_img, opt_path, pixel_scale=1.7)
+                save_fits(w1_img, w1_path, pixel_scale=2.75)
+                save_fits(w2_img, w2_path, pixel_scale=2.75)
+
+                epoch_jd = EPOCH1_JD + (epoch - 1) * delta_t_days
+                records.append({
+                    "example_id": f"conf_{i:04d}_{epoch_tag}",
+                    "optical_path": str(opt_path.relative_to(output_dir)),
+                    "w1_path": str(w1_path.relative_to(output_dir)),
+                    "w2_path": str(w2_path.relative_to(output_dir)),
+                    "source_present": False,  # NOT P9
+                    "temp_kelvin": temperature,  # Real temp (not NaN!)
+                    "epoch_jd": epoch_jd,
+                    "delta_t_days": delta_t_days,
+                })
+
+            if (i + 1) % 100 == 0:
+                print(f"  [{i+1}/{n_confuser}] T={temperature:.0f}K ({conf_cls})")
+
     catalog = pd.DataFrame(records)
     catalog_path = output_dir / "training_catalog.csv"
     catalog.to_csv(catalog_path, index=False)
@@ -399,13 +533,19 @@ def main():
     )
     parser.add_argument("--n-positive", type=int, default=300)
     parser.add_argument("--n-negative", type=int, default=300)
+    parser.add_argument("--n-confuser", type=int, default=0,
+                        help="Number of confuser negatives (hot sources, no motion)")
     parser.add_argument("--img-size", type=int, default=64)
     parser.add_argument("--snr-min", type=float, default=3.0)
     parser.add_argument("--snr-max", type=float, default=15.0)
     parser.add_argument("--temp-min", type=float, default=25.0,
-                        help="Min blackbody temperature (K)")
+                        help="Min blackbody temperature (K, p9_only profile)")
     parser.add_argument("--temp-max", type=float, default=60.0,
-                        help="Max blackbody temperature (K)")
+                        help="Max blackbody temperature (K, p9_only profile)")
+    parser.add_argument("--temp-profile", type=str, default="p9_only",
+                        choices=["p9_only", "calibrated"],
+                        help="Temperature sampling: p9_only (25-60K) or "
+                             "calibrated (15-10000K multi-class)")
     parser.add_argument("--motion-px", type=float, default=8.0)
     parser.add_argument("--color-noise", type=float, default=0.05,
                         help="Fractional color noise on W1/W2 ratio")
@@ -417,10 +557,14 @@ def main():
     print("  SPECTRAL TRAINING DATA GENERATOR — SSTF")
     print("=" * 60)
     print(f"  Output:      {args.output_dir}")
-    print(f"  Pairs:       {args.n_positive} pos + {args.n_negative} neg")
+    print(f"  Pairs:       {args.n_positive} pos + {args.n_negative} neg + {args.n_confuser} confuser")
     print(f"  Image size:  {args.img_size}x{args.img_size}")
     print(f"  Optical S/N: {args.snr_min:.0f}-{args.snr_max:.0f}")
-    print(f"  Temperature: {args.temp_min:.0f}-{args.temp_max:.0f} K")
+    print(f"  Temp profile: {args.temp_profile}")
+    if args.temp_profile == "p9_only":
+        print(f"  Temperature: {args.temp_min:.0f}-{args.temp_max:.0f} K")
+    else:
+        print(f"  Temperature: 15-10000 K (multi-class calibrated)")
     print(f"  Motion:      {args.motion_px:.0f} px")
     print(f"  Color noise: +/-{args.color_noise*100:.0f}%")
     print(f"  Seed:        {args.seed}")
@@ -431,11 +575,13 @@ def main():
         output_dir=args.output_dir,
         n_positive=args.n_positive,
         n_negative=args.n_negative,
+        n_confuser=args.n_confuser,
         img_size=args.img_size,
         snr_min=args.snr_min,
         snr_max=args.snr_max,
         temp_min=args.temp_min,
         temp_max=args.temp_max,
+        temp_profile=args.temp_profile,
         motion_px=args.motion_px,
         color_noise_frac=args.color_noise,
         seed=args.seed,
