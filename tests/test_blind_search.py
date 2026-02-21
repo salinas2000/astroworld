@@ -172,13 +172,14 @@ class TestPresets:
     def test_preset_bounds_valid(self):
         """Preset RA/Dec bounds are physically valid."""
         for name, preset in PRESETS.items():
-            assert 0 <= preset["ra_min"] < 360
-            assert 0 <= preset["ra_max"] <= 360
-            assert preset["ra_min"] < preset["ra_max"]
-            assert -90 <= preset["dec_min"] <= 90
-            assert -90 <= preset["dec_max"] <= 90
-            assert preset["dec_min"] < preset["dec_max"]
-            assert preset["step_deg"] > 0
+            assert 0 <= preset["ra_min"] < 360, f"{name}: ra_min"
+            # ra_max > 360 is allowed for RA-wrapping regions (e.g. cetus 350-380)
+            assert 0 < preset["ra_max"] <= 720, f"{name}: ra_max"
+            assert preset["ra_min"] < preset["ra_max"], f"{name}: ra order"
+            assert -90 <= preset["dec_min"] <= 90, f"{name}: dec_min"
+            assert -90 <= preset["dec_max"] <= 90, f"{name}: dec_max"
+            assert preset["dec_min"] < preset["dec_max"], f"{name}: dec order"
+            assert preset["step_deg"] > 0, f"{name}: step"
 
     def test_taurus_is_at_high_galactic_latitude(self):
         """Taurus region should be mostly above |b| > 10°."""

@@ -113,6 +113,31 @@ PRESETS = {
         "dec_min": 13.0, "dec_max": 16.5,
         "step_deg": 0.25,
     },
+    # --- New regions: P9 full-orbit coverage ---
+    "perihelion": {
+        "description": "P9 perihelion corridor (Ophiuchus/Libra, ~320 AU, brightest)",
+        "ra_min": 235.0, "ra_max": 258.0,
+        "dec_min": -17.0, "dec_max": -1.0,
+        "step_deg": 0.50,
+    },
+    "orion_fringe": {
+        "description": "Orion/Gemini fringe above galactic plane (|b|~16-25 deg)",
+        "ra_min": 108.0, "ra_max": 120.0,
+        "dec_min": 23.0, "dec_max": 27.0,
+        "step_deg": 0.25,
+    },
+    "cetus": {
+        "description": "Cetus/Aquarius cleanest sky (|b|>67 deg, ecliptic quadrature)",
+        "ra_min": 350.0, "ra_max": 380.0,  # wraps: 350-360 + 0-20
+        "dec_min": -20.0, "dec_max": -8.0,
+        "step_deg": 0.50,
+    },
+    "south_ecliptic": {
+        "description": "South ecliptic descent (Capricornus, max southern dec)",
+        "ra_min": 310.0, "ra_max": 345.0,
+        "dec_min": -27.0, "dec_max": -20.0,
+        "step_deg": 0.75,
+    },
 }
 
 ALL_STAGES = ["scan", "crossmatch", "blink", "dust_piercer"]
@@ -151,11 +176,13 @@ def generate_grid(
         for ra in ra_vals:
             if ra > ra_max:
                 continue
+            # Wrap RA > 360° back into [0, 360) range
+            ra_wrapped = float(ra) % 360.0
             if exclude_galactic_plane:
-                b = _galactic_latitude(ra, dec)
+                b = _galactic_latitude(ra_wrapped, dec)
                 if abs(b) < galactic_lat_cut:
                     continue
-            fields.append((round(float(ra), 4), round(float(dec), 4)))
+            fields.append((round(ra_wrapped, 4), round(float(dec), 4)))
     return fields
 
 
