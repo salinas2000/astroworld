@@ -565,11 +565,18 @@ class P9Survey:
 
         # Load pipeline (lazy)
         if self.pipeline is None:
-            logger.info("  Loading spectral model...")
-            pipeline_mode = (
-                "ir_only" if getattr(self.args, "ir_only", False)
-                else "spectral_only"
-            )
+            if getattr(self.args, "dp_direct", False):
+                pipeline_mode = "dp_direct"
+            elif getattr(self.args, "ir_only", False):
+                pipeline_mode = "ir_only"
+            else:
+                pipeline_mode = "spectral_only"
+
+            if pipeline_mode == "dp_direct":
+                logger.info("  DP-Direct mode: no ML model needed.")
+            else:
+                logger.info("  Loading spectral model...")
+
             config = PipelineConfig(
                 mode=pipeline_mode,
                 spectral_threshold=self.args.spectral_threshold,
@@ -580,8 +587,13 @@ class P9Survey:
                 output_dir=self.output_dir,
                 data_dir=self.args.data_dir,
             )
+            # dp_direct mode doesn't need spectral checkpoint
+            ckpt = (
+                None if pipeline_mode == "dp_direct"
+                else self.args.spectral_checkpoint
+            )
             self.pipeline = ObservatoryPipeline.from_checkpoints(
-                spectral_checkpoint=self.args.spectral_checkpoint,
+                spectral_checkpoint=ckpt,
                 config=config,
             )
 
@@ -1095,8 +1107,11 @@ class P9Survey:
         else:
             stages = list(ALL_STAGES)
 
-        # IR-only mode: skip BLINK (requires optical DSS2 + PS1 epochs)
-        if getattr(self.args, "ir_only", False) and "blink" in stages:
+        # IR-only / dp_direct mode: skip BLINK (requires optical DSS2+PS1)
+        if (
+            getattr(self.args, "ir_only", False)
+            or getattr(self.args, "dp_direct", False)
+        ) and "blink" in stages:
             stages.remove("blink")
 
         return stages
@@ -1108,7 +1123,12 @@ class P9Survey:
         stages: list[str],
     ) -> None:
         """Print survey header."""
-        ir_tag = " [IR-ONLY]" if getattr(self.args, "ir_only", False) else ""
+        if getattr(self.args, "dp_direct", False):
+            ir_tag = " [DP-DIRECT]"
+        elif getattr(self.args, "ir_only", False):
+            ir_tag = " [IR-ONLY]"
+        else:
+            ir_tag = ""
         logger.info("")
         logger.info("=" * 65)
         logger.info("  P9 SURVEY ORCHESTRATOR — Phase 20%s", ir_tag)
@@ -1268,8 +1288,9 @@ def parse_args() -> argparse.Namespace:
 
     # Model
     parser.add_argument(
-        "--spectral-checkpoint", type=Path, required=True,
-        help="Path to SpectralSiameseNet checkpoint",
+        "--spectral-checkpoint", type=Path, default=None,
+        help="Path to SpectralSiameseNet checkpoint "
+             "(not required for --dp-direct mode)",
     )
     parser.add_argument(
         "--device", type=str, default="auto",
@@ -1321,6 +1342,11 @@ def parse_args() -> argparse.Namespace:
         help="IR-only mode: skip optical, use WISE W1+W2 + Dust Piercer. "
              "For targets invisible in optical (P9 at ~25 mag).",
     )
+    parser.add_argument(
+        "--dp-direct", action="store_true",
+        help="DP-Direct mode: bypass ML model entirely. Classic 5-sigma "
+             "peak finding on WISE W2 + Dust Piercer. No checkpoint needed.",
+    )
 
     # Output
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -1342,6 +1368,15 @@ def main() -> None:
         print(
             "ERROR: Provide --region or all of --ra-min/--ra-max/"
             "--dec-min/--dec-max",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Validate checkpoint (not needed for dp_direct)
+    if not args.dp_direct and args.spectral_checkpoint is None:
+        print(
+            "ERROR: --spectral-checkpoint is required "
+            "(unless using --dp-direct mode)",
             file=sys.stderr,
         )
         sys.exit(1)

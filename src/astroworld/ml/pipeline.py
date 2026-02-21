@@ -74,6 +74,10 @@ class PipelineConfig:
         spectral cube, integrate Dust Piercer as primary validator.
         No optical dependency.  For objects invisible in optical
         (e.g. Planet 9 at ~25 mag, beyond DSS2 limit of ~21 mag).
+        ``"dp_direct"`` — bypass SSTF ML model entirely.  Uses classic
+        5-sigma peak finding on WISE W2 and validates directly with
+        Dust Piercer morphology + NEOWISE proper motion.  Fastest mode,
+        no neural network, pure algorithmic detection.
     """
 
     # --- Mode ---
@@ -107,9 +111,12 @@ class PipelineConfig:
     snr_annulus_inner: int = 20     # Inner radius of background annulus (pixels)
     snr_annulus_outer: int = 30     # Outer radius of background annulus (pixels)
 
-    # --- IR-only mode ---
+    # --- IR-only / dp_direct mode ---
     ir_snr_band: str = "W2"  # Band for SNR filter in ir_only mode (W1 fallback)
     dp_pointiness_threshold: float = 0.20  # Relaxed for small (fallback) images
+    dp_peak_sigma: float = 5.0   # Peak detection threshold (n-sigma above background)
+    dp_peak_neighborhood: int = 5  # Local maximum filter radius (pixels)
+    dp_max_peaks: int = 50       # Cap on raw peaks per field (brightest kept)
 
     # --- Stage 4: Kinematic filter ---
     kinematic_enabled: bool = True
@@ -235,7 +242,7 @@ class ObservatoryPipeline:
     def __init__(
         self,
         config: PipelineConfig,
-        spectral_searcher: SpectralSearcher,
+        spectral_searcher: SpectralSearcher | None = None,
         optical_searcher: P9Searcher | None = None,
     ):
         self.config = config
@@ -248,10 +255,17 @@ class ObservatoryPipeline:
                 "Provide optical_checkpoint to from_checkpoints()."
             )
 
+        if config.mode != "dp_direct" and spectral_searcher is None:
+            raise ValueError(
+                f"mode={config.mode!r} requires spectral_searcher. "
+                "Use dp_direct mode to bypass ML model, or provide "
+                "spectral_checkpoint to from_checkpoints()."
+            )
+
     @classmethod
     def from_checkpoints(
         cls,
-        spectral_checkpoint: Path | str,
+        spectral_checkpoint: Path | str | None = None,
         optical_checkpoint: Path | str | None = None,
         config: PipelineConfig | None = None,
     ) -> ObservatoryPipeline:
@@ -260,6 +274,7 @@ class ObservatoryPipeline:
         Parameters
         ----------
         spectral_checkpoint : Path to SpectralSiameseNet ``best_model.pt``.
+            Not required for ``dp_direct`` mode (no ML model used).
         optical_checkpoint : Path to P9SiameseDetector ``best_model.pt``.
             Required only for ``dual_optical`` mode.
         config : Pipeline configuration.  Defaults to ``spectral_only``.
@@ -271,14 +286,17 @@ class ObservatoryPipeline:
         if config is None:
             config = PipelineConfig()
 
-        spectral_searcher = SpectralSearcher.from_checkpoint(
-            spectral_checkpoint,
-            patch_size=config.patch_size,
-            overlap=config.overlap,
-            threshold=config.spectral_threshold,
-            mc_samples=config.mc_samples,
-            device=config.device,
-        )
+        # dp_direct mode: no ML model needed
+        spectral_searcher = None
+        if config.mode != "dp_direct" and spectral_checkpoint is not None:
+            spectral_searcher = SpectralSearcher.from_checkpoint(
+                spectral_checkpoint,
+                patch_size=config.patch_size,
+                overlap=config.overlap,
+                threshold=config.spectral_threshold,
+                mc_samples=config.mc_samples,
+                device=config.device,
+            )
 
         optical_searcher = None
         if optical_checkpoint is not None:
@@ -373,14 +391,21 @@ class ObservatoryPipeline:
                     return result
 
             # Stage 2: Download images
-            if self.config.mode == "ir_only":
+            if self.config.mode in ("ir_only", "dp_direct"):
                 result = self._stage2_download_ir_only(result)
             else:
                 result = self._stage2_download(result)
 
-            # Stage 3: Spectral validation
-            if self.config.mode == "ir_only":
-                # IR-only: require W1, no optical needed
+            # Stage 3: Detection + validation
+            if self.config.mode == "dp_direct":
+                # DP-Direct: classic peak finding, no ML model
+                if result.w2_path is None and result.w1_path is None:
+                    result.error = "No IR image available"
+                    result.total_time_sec = time.time() - t0
+                    return result
+                result = self._stage3_dp_direct(result)
+            elif self.config.mode == "ir_only":
+                # IR-only: require W1, SSTF on IR cube
                 if result.w1_path is None:
                     result.error = "No W1 image available"
                     result.total_time_sec = time.time() - t0
@@ -1122,6 +1147,188 @@ class ObservatoryPipeline:
         result.stage3b_dp_analyzed = len(result.stage3_candidates)
         result.stage3b_dp_verdicts = verdicts
         result.stage3_candidates = enriched
+        result.inference_time_sec += time.time() - t0
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Stage 3 DP-Direct: Classic peak finding + Dust Piercer
+    # ------------------------------------------------------------------
+
+    def _stage3_dp_direct(self, result: FieldResult) -> FieldResult:
+        """Bypass SSTF entirely — classic 5-sigma peak finding on W2.
+
+        Uses ``sigma_clipped_stats`` for robust background estimation and
+        ``maximum_filter`` for local peak detection.  Each peak is passed
+        directly to Dust Piercer for morphology + NEOWISE PM validation.
+
+        No neural network, no spectral cube.  Pure algorithmic detection.
+        """
+        from astropy.stats import sigma_clipped_stats
+        from astropy.wcs import WCS
+        from scipy.ndimage import maximum_filter
+
+        from astroworld.imaging.dust_piercer import analyze_candidate
+
+        t0 = time.time()
+
+        # Prefer W2 (P9 brightest at 4.6 um), fallback to W1
+        ir_path = result.w2_path or result.w1_path
+        ir_img, ir_hdr = load_fits_image(Path(ir_path))
+        ir_hdr_dict = (
+            dict(ir_hdr) if hasattr(ir_hdr, "items") else ir_hdr
+        )
+        ir_band = "W2" if result.w2_path else "W1"
+
+        # 1. Background estimation (sigma-clipped)
+        mean, median, std = sigma_clipped_stats(ir_img, sigma=3.0)
+        threshold = median + (self.config.dp_peak_sigma * std)
+
+        # 2. Local maxima above threshold
+        nbr = self.config.dp_peak_neighborhood
+        local_max = maximum_filter(ir_img, size=2 * nbr + 1) == ir_img
+        above_threshold = ir_img > threshold
+        peaks = local_max & above_threshold
+
+        y_coords, x_coords = np.where(peaks)
+
+        if self.config.verbose:
+            print(
+                f"    [DP-Direct] {len(x_coords)} raw "
+                f"{self.config.dp_peak_sigma:.0f}-sigma peaks in {ir_band} "
+                f"(bkg={median:.1f}, thr={threshold:.1f})"
+            )
+
+        # Cap to brightest N to prevent NEOWISE API overload
+        if len(x_coords) > self.config.dp_max_peaks:
+            intensities = ir_img[y_coords, x_coords]
+            top_idx = np.argsort(intensities)[-self.config.dp_max_peaks :]
+            x_coords = x_coords[top_idx]
+            y_coords = y_coords[top_idx]
+            if self.config.verbose:
+                print(
+                    f"    [DP-Direct] Capped to top "
+                    f"{self.config.dp_max_peaks} brightest peaks"
+                )
+
+        # 3. Pixel → RA/Dec via WCS
+        try:
+            wcs = WCS(ir_hdr_dict)
+            # pixel_to_world_values expects (x, y) order
+            ra_arr, dec_arr = wcs.pixel_to_world_values(
+                x_coords.astype(float), y_coords.astype(float)
+            )
+        except Exception:
+            # Fallback: use field center for all peaks
+            ra_arr = np.full(len(x_coords), result.ra_deg)
+            dec_arr = np.full(len(x_coords), result.dec_deg)
+
+        # 4. Load W2 for Dust Piercer (need image + header)
+        w2_img, w2_hdr = None, None
+        if result.w2_path:
+            w2_img, w2_hdr = load_fits_image(Path(result.w2_path))
+            w2_hdr = (
+                dict(w2_hdr) if hasattr(w2_hdr, "items") else w2_hdr
+            )
+        else:
+            # Use whatever IR we have
+            w2_img = ir_img
+            w2_hdr = ir_hdr_dict
+
+        is_small_image = min(w2_img.shape) < 300
+
+        # 5. Run Dust Piercer on each peak
+        enriched: list[dict] = []
+        verdicts: dict[str, int] = {}
+
+        for i in range(len(x_coords)):
+            ra_i = float(ra_arr[i])
+            dec_i = float(dec_arr[i])
+            px_i = float(x_coords[i])
+            py_i = float(y_coords[i])
+            peak_flux = float(ir_img[y_coords[i], x_coords[i]])
+
+            try:
+                dp_result = analyze_candidate(
+                    ra_i, dec_i,
+                    w2_img, w2_hdr,
+                    rate_limit_sec=self.config.rate_limit_sec,
+                    skip_neowise=False,
+                )
+
+                verdict = dp_result.verdict
+
+                # Relaxed pointiness for small fallback images
+                if (
+                    is_small_image
+                    and verdict == "DIFFUSE"
+                    and dp_result.morphology
+                    and dp_result.morphology.pointiness
+                    >= self.config.dp_pointiness_threshold
+                ):
+                    verdict = "POINT_STATIC"
+
+                verdicts[verdict] = verdicts.get(verdict, 0) + 1
+
+                if verdict in ("POINT_MOVING", "POINT_STATIC"):
+                    cand = {
+                        "pixel_x": px_i,
+                        "pixel_y": py_i,
+                        "ra_deg": ra_i,
+                        "dec_deg": dec_i,
+                        "probability": 1.0,  # Classic detection, no ML score
+                        "temperature_k": 0.0,  # Not estimated in dp_direct
+                        "temperature_std_k": 0.0,
+                        "planck_class": "dp_direct",
+                        "peak_flux": peak_flux,
+                        "peak_sigma": (peak_flux - median) / max(std, 1e-10),
+                        "dp_verdict": verdict,
+                        "dp_confidence": dp_result.confidence,
+                    }
+                    if dp_result.morphology:
+                        cand["dp_pointiness"] = (
+                            dp_result.morphology.pointiness
+                        )
+                        cand["dp_snr"] = dp_result.morphology.snr
+                    if dp_result.proper_motion:
+                        cand["dp_pm_arcsec_yr"] = (
+                            dp_result.proper_motion.mu_total_arcsec_yr
+                        )
+                        cand["dp_pm_significance"] = (
+                            dp_result.proper_motion.pm_significance
+                        )
+                    enriched.append(cand)
+
+                    if verdict == "POINT_MOVING" and self.config.verbose:
+                        pm = dp_result.proper_motion
+                        pm_str = (
+                            f"{pm.mu_total_arcsec_yr:.2f}\"/yr "
+                            f"({pm.pm_significance:.1f}σ)"
+                            if pm else "?"
+                        )
+                        print(
+                            f"    *** POINT_MOVING at "
+                            f"RA={ra_i:.4f} Dec={dec_i:.4f} "
+                            f"PM={pm_str} ***"
+                        )
+
+            except Exception as e:
+                verdicts["ERROR"] = verdicts.get("ERROR", 0) + 1
+                if self.config.verbose:
+                    print(f"    [DP error] peak {i}: {e}")
+
+        if self.config.verbose:
+            n_total = len(x_coords)
+            n_kept = len(enriched)
+            print(
+                f"    [DP-Direct] {n_kept}/{n_total} peaks survived: "
+                f"{verdicts}"
+            )
+
+        result.stage3_detections = len(x_coords)
+        result.stage3_candidates = enriched
+        result.stage3b_dp_analyzed = len(x_coords)
+        result.stage3b_dp_verdicts = verdicts
         result.inference_time_sec += time.time() - t0
 
         return result

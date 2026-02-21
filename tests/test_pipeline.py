@@ -1371,3 +1371,270 @@ class TestIROnlyMode:
         # In spectral_only, optical_path SHOULD be set
         assert result.optical_path is not None
         assert result.error is None
+
+
+# ---------------------------------------------------------------------------
+# TestDPDirectMode — dp_direct mode (classic peak finding + Dust Piercer)
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_fits_with_peaks(
+    path: Path,
+    nx: int = 64,
+    ny: int = 64,
+    ra: float = 180.0,
+    dec: float = 30.0,
+    peaks: list[tuple[int, int, float]] | None = None,
+    pixel_scale_arcsec: float = 2.75,
+) -> None:
+    """Write a synthetic FITS with optional bright point-source peaks.
+
+    Parameters
+    ----------
+    peaks : list of (x, y, flux) tuples — injected point sources.
+    """
+    from astropy.io import fits
+
+    rng = np.random.default_rng(42)
+    data = rng.normal(10.0, 1.0, size=(ny, nx)).astype(np.float32)
+    if peaks:
+        for x, y, flux in peaks:
+            data[y, x] = flux  # 5σ ⇒ flux = 10 + 5*1 = 15, so ≥20 is safe
+    hdu = fits.PrimaryHDU(data)
+    hdr = hdu.header
+    hdr["NAXIS1"] = nx
+    hdr["NAXIS2"] = ny
+    hdr["CTYPE1"] = "RA---TAN"
+    hdr["CTYPE2"] = "DEC--TAN"
+    hdr["CRVAL1"] = ra
+    hdr["CRVAL2"] = dec
+    hdr["CRPIX1"] = (nx + 1) / 2.0
+    hdr["CRPIX2"] = (ny + 1) / 2.0
+    hdr["CDELT1"] = -pixel_scale_arcsec / 3600.0
+    hdr["CDELT2"] = pixel_scale_arcsec / 3600.0
+    hdr["CUNIT1"] = "deg"
+    hdr["CUNIT2"] = "deg"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdu.writeto(str(path), overwrite=True)
+
+
+def _mock_download_with_peaks(tmp_path: Path, peaks=None):
+    """Mock download_field that writes W2 FITS with injected peaks."""
+
+    def _mock_download(
+        ra_deg, dec_deg, surveys=None,
+        radius_arcmin=5.0, pixels=64, output_dir=None,
+        rate_limit_sec=0.0,
+    ):
+        from astroworld.imaging.survey_download import _survey_to_dir
+
+        surveys = surveys or ["WISE 3.4", "WISE 4.6"]
+        paths = []
+        for survey in surveys:
+            survey_dir = _survey_to_dir(survey)
+            dec_str = (
+                f"+{dec_deg:.3f}" if dec_deg >= 0 else f"{dec_deg:.3f}"
+            )
+            fname = f"field_ra{ra_deg:07.3f}_dec{dec_str}.fits"
+            path = tmp_path / survey_dir / fname
+            if not path.exists():
+                if "4.6" in survey and peaks:
+                    _write_synthetic_fits_with_peaks(
+                        path, nx=pixels, ny=pixels,
+                        ra=ra_deg, dec=dec_deg, peaks=peaks,
+                    )
+                else:
+                    _write_synthetic_fits(
+                        path, nx=pixels, ny=pixels,
+                        ra=ra_deg, dec=dec_deg,
+                        pixel_scale_arcsec=2.75,
+                    )
+            paths.append(path)
+        return paths
+
+    return _mock_download
+
+
+def _make_mock_dp_result(verdict="POINT_STATIC", pointiness=0.5):
+    """Create a mock DustPiercerResult for testing."""
+    from types import SimpleNamespace
+
+    morph = SimpleNamespace(
+        snr=10.0,
+        pointiness=pointiness,
+        fwhm_x_arcsec=4.0,
+        fwhm_y_arcsec=4.2,
+        ellipticity=0.05,
+        is_point_source=(verdict != "DIFFUSE"),
+    )
+    pm = SimpleNamespace(
+        n_detections=15,
+        n_epochs=5,
+        baseline_years=8.0,
+        mu_ra_arcsec_yr=0.5,
+        mu_dec_arcsec_yr=0.3,
+        mu_total_arcsec_yr=0.58,
+        pm_significance=3.5,
+        mean_w2mag=14.0,
+    ) if verdict == "POINT_MOVING" else None
+
+    return SimpleNamespace(
+        ra_deg=180.0,
+        dec_deg=30.0,
+        verdict=verdict,
+        confidence="high",
+        passed_morphology=(verdict != "NO_SOURCE"),
+        has_significant_pm=(verdict == "POINT_MOVING"),
+        morphology=morph,
+        proper_motion=pm,
+    )
+
+
+@requires_torch
+class TestDPDirectMode:
+    """Tests for dp_direct pipeline mode (classic peak finding + Dust Piercer)."""
+
+    def test_config_accepts_dp_direct(self):
+        """PipelineConfig accepts dp_direct mode with peak params."""
+        from astroworld.ml.pipeline import PipelineConfig
+
+        cfg = PipelineConfig(mode="dp_direct")
+        assert cfg.mode == "dp_direct"
+        assert cfg.dp_peak_sigma == 5.0
+        assert cfg.dp_peak_neighborhood == 5
+        assert cfg.dp_max_peaks == 50
+
+    def test_dp_direct_no_spectral_searcher(self):
+        """dp_direct mode works without spectral_searcher."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        cfg = PipelineConfig(mode="dp_direct")
+        pipeline = ObservatoryPipeline(cfg, spectral_searcher=None)
+        assert pipeline.spectral_searcher is None
+
+    def test_dp_direct_from_checkpoints_no_model(self):
+        """from_checkpoints with dp_direct and no checkpoint succeeds."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        cfg = PipelineConfig(mode="dp_direct")
+        pipeline = ObservatoryPipeline.from_checkpoints(
+            spectral_checkpoint=None, config=cfg,
+        )
+        assert pipeline.spectral_searcher is None
+
+    def test_dp_direct_no_ir_gives_error(self, tmp_path):
+        """dp_direct with no IR images returns error."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        cfg = PipelineConfig(
+            mode="dp_direct",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(cfg, spectral_searcher=None)
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            return_value=[],
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        assert result.error == "No IR image available"
+
+    def test_dp_direct_finds_peaks(self, tmp_path):
+        """dp_direct detects injected bright peaks and runs Dust Piercer."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        cfg = PipelineConfig(
+            mode="dp_direct",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(cfg, spectral_searcher=None)
+
+        # Inject 2 bright peaks well above 5σ (bkg~10, std~1 → thr~15)
+        peaks = [(20, 20, 50.0), (40, 40, 80.0)]
+
+        mock_dp = _make_mock_dp_result("POINT_STATIC")
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_with_peaks(tmp_path, peaks=peaks),
+        ), patch(
+            "astroworld.imaging.dust_piercer.analyze_candidate",
+            return_value=mock_dp,
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        assert result.error is None
+        assert result.stage3_detections >= 2  # At least our 2 injected peaks
+        assert result.stage3b_dp_analyzed >= 2
+        # Both marked POINT_STATIC → should appear as candidates
+        assert len(result.stage3_candidates) >= 2
+        for cand in result.stage3_candidates:
+            assert cand["planck_class"] == "dp_direct"
+            assert cand["dp_verdict"] == "POINT_STATIC"
+
+    def test_dp_direct_filters_diffuse(self, tmp_path):
+        """dp_direct rejects DIFFUSE verdicts from Dust Piercer."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        cfg = PipelineConfig(
+            mode="dp_direct",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(cfg, spectral_searcher=None)
+
+        peaks = [(30, 30, 60.0)]
+        mock_dp = _make_mock_dp_result("DIFFUSE", pointiness=0.1)
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_with_peaks(tmp_path, peaks=peaks),
+        ), patch(
+            "astroworld.imaging.dust_piercer.analyze_candidate",
+            return_value=mock_dp,
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        assert result.error is None
+        assert result.stage3_detections >= 1
+        # DIFFUSE should be rejected → no candidates
+        assert len(result.stage3_candidates) == 0
+        assert result.stage3b_dp_verdicts.get("DIFFUSE", 0) >= 1
+
+    def test_dp_direct_full_pipeline(self, tmp_path):
+        """End-to-end dp_direct pipeline via run()."""
+        from astroworld.ml.pipeline import ObservatoryPipeline, PipelineConfig
+
+        output_dir = tmp_path / "results"
+        cfg = PipelineConfig(
+            mode="dp_direct",
+            data_dir=tmp_path,
+            output_dir=output_dir,
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(cfg, spectral_searcher=None)
+
+        peaks = [(25, 25, 40.0)]
+        mock_dp = _make_mock_dp_result("POINT_MOVING")
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_with_peaks(tmp_path, peaks=peaks),
+        ), patch(
+            "astroworld.imaging.dust_piercer.analyze_candidate",
+            return_value=mock_dp,
+        ):
+            summary = pipeline.run(fields=[(180.0, 30.0)])
+
+        assert summary.n_fields_processed == 1
+        assert summary.n_fields_errored == 0
+        assert summary.total_candidates >= 1

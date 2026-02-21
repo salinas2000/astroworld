@@ -226,8 +226,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--spectral-checkpoint",
         type=Path,
-        required=True,
-        help="Path to SpectralSiameseNet checkpoint",
+        default=None,
+        help="Path to SpectralSiameseNet checkpoint "
+             "(not required for --dp-direct mode)",
     )
     parser.add_argument(
         "--optical-checkpoint",
@@ -332,6 +333,11 @@ def parse_args() -> argparse.Namespace:
         help="IR-only mode: skip optical, use WISE W1+W2 + Dust Piercer. "
              "For targets invisible in optical (P9 at ~25 mag).",
     )
+    parser.add_argument(
+        "--dp-direct", action="store_true",
+        help="DP-Direct mode: bypass ML model entirely. Classic 5-sigma "
+             "peak finding on WISE W2 + Dust Piercer. No checkpoint needed.",
+    )
 
     return parser.parse_args()
 
@@ -427,7 +433,22 @@ def main() -> None:
     if not args.planck_strict:
         planck_keep.append("cold_object")
 
-    pipeline_mode = "ir_only" if getattr(args, "ir_only", False) else "spectral_only"
+    if getattr(args, "dp_direct", False):
+        pipeline_mode = "dp_direct"
+    elif getattr(args, "ir_only", False):
+        pipeline_mode = "ir_only"
+    else:
+        pipeline_mode = "spectral_only"
+
+    # Validate checkpoint (not needed for dp_direct)
+    if pipeline_mode != "dp_direct" and args.spectral_checkpoint is None:
+        print(
+            "ERROR: --spectral-checkpoint is required "
+            "(unless using --dp-direct mode)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     config = PipelineConfig(
         mode=pipeline_mode,
         spectral_threshold=args.spectral_threshold,
@@ -439,9 +460,13 @@ def main() -> None:
         data_dir=args.data_dir,
     )
 
-    print(f"\n  Loading model: {args.spectral_checkpoint}")
+    ckpt = None if pipeline_mode == "dp_direct" else args.spectral_checkpoint
+    if pipeline_mode == "dp_direct":
+        print("\n  DP-Direct mode: no ML model needed.")
+    else:
+        print(f"\n  Loading model: {args.spectral_checkpoint}")
     pipeline = ObservatoryPipeline.from_checkpoints(
-        spectral_checkpoint=args.spectral_checkpoint,
+        spectral_checkpoint=ckpt,
         optical_checkpoint=args.optical_checkpoint,
         config=config,
     )
