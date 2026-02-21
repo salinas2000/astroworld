@@ -97,6 +97,12 @@ class PipelineConfig:
     )
     ir_min_valid_fraction: float = 0.90  # Per-patch: reject if <90% IR pixels > 0
 
+    # --- SNR photometric filter (noise rejection) ---
+    snr_min: float = 3.0            # Minimum optical SNR to keep a candidate
+    snr_aperture_radius: int = 3    # Aperture half-size for peak flux (pixels)
+    snr_annulus_inner: int = 20     # Inner radius of background annulus (pixels)
+    snr_annulus_outer: int = 30     # Outer radius of background annulus (pixels)
+
     # --- Stage 4: Kinematic filter ---
     kinematic_enabled: bool = True
     kinematic_min_px: float = 0.5
@@ -379,6 +385,88 @@ class ObservatoryPipeline:
         return result
 
     # ------------------------------------------------------------------
+    # SNR photometric filter (noise rejection)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _patch_snr(
+        image: np.ndarray,
+        px: float,
+        py: float,
+        aperture_r: int = 3,
+        annulus_inner: int = 20,
+        annulus_outer: int = 30,
+    ) -> float:
+        """Compute robust aperture SNR for a candidate position.
+
+        Uses MAD (Median Absolute Deviation) for background noise
+        estimation — robust to cosmic rays and bright neighbours.
+
+        Parameters
+        ----------
+        image : 2D array (full field image).
+        px, py : Candidate center position in pixels.
+        aperture_r : Half-size of square aperture for peak flux.
+        annulus_inner, annulus_outer : Background annulus radii (pixels).
+
+        Returns
+        -------
+        snr : float.  Peak pixel minus median background, divided by
+              MAD-estimated sigma.  Returns 0.0 on error.
+        """
+        h, w = image.shape[-2], image.shape[-1]
+        if image.ndim == 3:
+            image = image[0]
+
+        ix, iy = int(round(px)), int(round(py))
+
+        # Aperture: small box around center
+        ay0 = max(iy - aperture_r, 0)
+        ay1 = min(iy + aperture_r + 1, h)
+        ax0 = max(ix - aperture_r, 0)
+        ax1 = min(ix + aperture_r + 1, w)
+        aperture = image[ay0:ay1, ax0:ax1]
+
+        if aperture.size == 0:
+            return 0.0
+
+        peak = float(np.max(aperture))
+
+        # Background annulus: ring between inner and outer radius
+        yy, xx = np.ogrid[:h, :w]
+        dist2 = (xx - ix) ** 2 + (yy - iy) ** 2
+        annulus_mask = (dist2 >= annulus_inner**2) & (dist2 <= annulus_outer**2)
+
+        bg_pixels = image[annulus_mask]
+        if bg_pixels.size < 10:
+            # Fallback: use entire patch edges
+            patch_size = 64
+            py0 = max(iy - patch_size // 2, 0)
+            px0 = max(ix - patch_size // 2, 0)
+            py1 = min(py0 + patch_size, h)
+            px1 = min(px0 + patch_size, w)
+            patch = image[py0:py1, px0:px1]
+            # Use border pixels (outer 5 rows/cols)
+            border = np.concatenate([
+                patch[:5].ravel(), patch[-5:].ravel(),
+                patch[:, :5].ravel(), patch[:, -5:].ravel(),
+            ])
+            bg_pixels = border
+
+        if bg_pixels.size == 0:
+            return 0.0
+
+        bg_median = float(np.median(bg_pixels))
+        # MAD-based sigma: robust to outliers
+        mad = float(np.median(np.abs(bg_pixels - bg_median)))
+        sigma = 1.4826 * mad  # MAD to Gaussian sigma conversion
+
+        if sigma < 1e-6:
+            return 0.0
+
+        return (peak - bg_median) / sigma
+
+    # ------------------------------------------------------------------
     # Stage 1: Fast optical pre-scan (dual_optical mode only)
     # ------------------------------------------------------------------
 
@@ -568,6 +656,34 @@ class ObservatoryPipeline:
                     "planck_class": planck_class,
                 }
             )
+
+        # ---- SNR photometric filter (noise rejection) --------------------
+        # Reject candidates whose optical patch is pure background noise.
+        # Uses robust MAD-based sigma to avoid cosmic ray contamination.
+        snr_threshold = self.config.snr_min
+        n_before_snr = len(enriched)
+        if snr_threshold > 0:
+            snr_filtered = []
+            for c in enriched:
+                snr = self._patch_snr(
+                    optical,
+                    c["pixel_x"],
+                    c["pixel_y"],
+                    aperture_r=self.config.snr_aperture_radius,
+                    annulus_inner=self.config.snr_annulus_inner,
+                    annulus_outer=self.config.snr_annulus_outer,
+                )
+                c["optical_snr"] = round(snr, 2)
+                if snr >= snr_threshold:
+                    snr_filtered.append(c)
+
+            n_rejected_snr = n_before_snr - len(snr_filtered)
+            if n_rejected_snr > 0 and self.config.verbose:
+                print(
+                    f"    [SNR filter] {n_rejected_snr}/{n_before_snr} "
+                    f"rejected (optical SNR < {snr_threshold:.1f})"
+                )
+            enriched = snr_filtered
 
         # ---- Per-patch IR quality filter --------------------------------
         # Even when a WISE image exists for the whole field, the patch's
