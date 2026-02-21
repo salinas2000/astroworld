@@ -61,6 +61,19 @@ try:
 except ImportError:
     pass
 
+from astroworld.imaging.time_machine import (
+    BlinkResult,
+    download_ps1_cutout,
+    find_dss2_field,
+    align_epochs,
+    measure_source_snr,
+    measure_shift,
+    classify_verdict,
+    blink_candidate,
+    blink_candidates,
+    make_blink_card,
+)
+
 from astroworld.imaging.spectral_cube import (
     build_spectral_cube,
     build_spectral_cube_cached,
@@ -105,6 +118,17 @@ __all__ = [
     # Reprojection (optional)
     "reproject_to_common_frame",
     "build_common_wcs",
+    # Time machine (multi-epoch blink)
+    "BlinkResult",
+    "download_ps1_cutout",
+    "find_dss2_field",
+    "align_epochs",
+    "measure_source_snr",
+    "measure_shift",
+    "classify_verdict",
+    "blink_candidate",
+    "blink_candidates",
+    "make_blink_card",
     # Spectral cube
     "build_spectral_cube",
     "build_spectral_cube_cached",

@@ -42,6 +42,7 @@ _SURVEY_DIR_MAP = {
     "2MASS-J": "2mass_j",
     "2MASS-H": "2mass_h",
     "2MASS-K": "2mass_k",
+    "PS1 r": "ps1_r",
 }
 
 
