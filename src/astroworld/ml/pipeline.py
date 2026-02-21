@@ -70,6 +70,10 @@ class PipelineConfig:
         directly on downloaded survey images.
         ``"dual_optical"`` — download two optical surveys, run P9Searcher
         as a fast pre-filter before spectral analysis.
+        ``"ir_only"`` — download only WISE W1+W2, build IR-anchored
+        spectral cube, integrate Dust Piercer as primary validator.
+        No optical dependency.  For objects invisible in optical
+        (e.g. Planet 9 at ~25 mag, beyond DSS2 limit of ~21 mag).
     """
 
     # --- Mode ---
@@ -102,6 +106,10 @@ class PipelineConfig:
     snr_aperture_radius: int = 3    # Aperture half-size for peak flux (pixels)
     snr_annulus_inner: int = 20     # Inner radius of background annulus (pixels)
     snr_annulus_outer: int = 30     # Outer radius of background annulus (pixels)
+
+    # --- IR-only mode ---
+    ir_snr_band: str = "W2"  # Band for SNR filter in ir_only mode (W1 fallback)
+    dp_pointiness_threshold: float = 0.20  # Relaxed for small (fallback) images
 
     # --- Stage 4: Kinematic filter ---
     kinematic_enabled: bool = True
@@ -158,6 +166,10 @@ class FieldResult:
 
     # Final
     final_candidates: list[dict] = field(default_factory=list)
+
+    # Stage 3b: Dust Piercer (ir_only mode)
+    stage3b_dp_analyzed: int = 0
+    stage3b_dp_verdicts: dict[str, int] = field(default_factory=dict)
 
     # Timing
     download_time_sec: float = 0.0
@@ -353,7 +365,7 @@ class ObservatoryPipeline:
         )
 
         try:
-            # Stage 1: Optional optical pre-scan
+            # Stage 1: Optional optical pre-scan (dual_optical only)
             if self.config.mode == "dual_optical":
                 result = self._stage1_optical_scan(result)
                 if not result.stage1_passed:
@@ -361,19 +373,36 @@ class ObservatoryPipeline:
                     return result
 
             # Stage 2: Download images
-            result = self._stage2_download(result)
+            if self.config.mode == "ir_only":
+                result = self._stage2_download_ir_only(result)
+            else:
+                result = self._stage2_download(result)
 
             # Stage 3: Spectral validation
-            if result.optical_path is None:
-                result.error = "No optical image available"
-                result.total_time_sec = time.time() - t0
-                return result
-            result = self._stage3_spectral(result)
-            if result.stage3_detections == 0:
-                result.total_time_sec = time.time() - t0
-                return result
+            if self.config.mode == "ir_only":
+                # IR-only: require W1, no optical needed
+                if result.w1_path is None:
+                    result.error = "No W1 image available"
+                    result.total_time_sec = time.time() - t0
+                    return result
+                result = self._stage3_ir_spectral(result)
+                if result.stage3_detections == 0:
+                    result.total_time_sec = time.time() - t0
+                    return result
+                # Stage 3b: Integrated Dust Piercer validation
+                result = self._stage3b_dust_piercer(result)
+            else:
+                # Optical modes: require optical image
+                if result.optical_path is None:
+                    result.error = "No optical image available"
+                    result.total_time_sec = time.time() - t0
+                    return result
+                result = self._stage3_spectral(result)
+                if result.stage3_detections == 0:
+                    result.total_time_sec = time.time() - t0
+                    return result
 
-            # Stage 4: Kinematic filter
+            # Stage 4: Kinematic filter (same for all modes)
             result = self._stage4_kinematic(result)
 
         except Exception as e:
@@ -545,6 +574,45 @@ class ObservatoryPipeline:
             if "dss2_red" in path_lower:
                 result.optical_path = str(path)
             elif "wise_3.4" in path_lower or "wise_3_4" in path_lower:
+                result.w1_path = str(path)
+            elif "wise_4.6" in path_lower or "wise_4_6" in path_lower:
+                result.w2_path = str(path)
+
+        result.ir_downloaded = (
+            result.w1_path is not None or result.w2_path is not None
+        )
+        result.download_time_sec += time.time() - t0
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Stage 2b: IR-only download (no optical)
+    # ------------------------------------------------------------------
+
+    def _stage2_download_ir_only(self, result: FieldResult) -> FieldResult:
+        """Download WISE W1/W2 images only — no optical survey.
+
+        Used in ``ir_only`` mode where DSS2 is not required (targets
+        invisible in optical, e.g. Planet 9 at ~25 mag).
+        """
+        t0 = time.time()
+
+        surveys = list(self.config.ir_surveys)  # ["WISE 3.4", "WISE 4.6"]
+
+        paths = download_field(
+            result.ra_deg,
+            result.dec_deg,
+            surveys=surveys,
+            radius_arcmin=self.config.download_radius_arcmin,
+            pixels=self.config.download_pixels,
+            output_dir=self.config.data_dir,
+            rate_limit_sec=self.config.rate_limit_sec,
+        )
+
+        # Map paths to W1/W2 (no optical mapping)
+        for path in paths:
+            path_lower = str(path).lower()
+            if "wise_3.4" in path_lower or "wise_3_4" in path_lower:
                 result.w1_path = str(path)
             elif "wise_4.6" in path_lower or "wise_4_6" in path_lower:
                 result.w2_path = str(path)
@@ -766,6 +834,299 @@ class ObservatoryPipeline:
         return result
 
     # ------------------------------------------------------------------
+    # Stage 3 IR: Spectral validation (ir_only mode)
+    # ------------------------------------------------------------------
+
+    def _stage3_ir_spectral(self, result: FieldResult) -> FieldResult:
+        """Build IR-only spectral cube and run SSTF inference.
+
+        Uses WISE W1 as the spatial reference frame instead of optical.
+        SNR filter uses W2 (or W1 fallback) instead of optical.
+        """
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        t0 = time.time()
+
+        # Load W1 (mandatory in ir_only mode)
+        w1, w1_hdr = load_fits_image(Path(result.w1_path))
+        result.has_w1 = True
+
+        w2, w2_hdr = None, None
+        if result.w2_path:
+            try:
+                w2, w2_hdr = load_fits_image(Path(result.w2_path))
+                result.has_w2 = True
+            except Exception:
+                pass  # Missing W2 → zeros in cube
+
+        # Build IR cube (W1 as reference)
+        target_shape = w1.shape
+        w1_hdr_dict = (
+            dict(w1_hdr) if hasattr(w1_hdr, "items") else w1_hdr
+        )
+        w2_hdr_dict = (
+            dict(w2_hdr)
+            if w2_hdr is not None and hasattr(w2_hdr, "items")
+            else w2_hdr
+        )
+
+        cube1 = build_ir_cube(
+            w1, w1_hdr_dict,
+            w2, w2_hdr_dict,
+            target_shape=target_shape,
+        )
+        cube2 = cube1.copy()
+        # Temporal gradient = 0 for single-epoch IR (already zeros)
+
+        # Run SpectralSearcher
+        spectral_result = self.spectral_searcher.search_from_cubes(
+            cube1,
+            cube2,
+            label_1=result.w1_path or result.field_id,
+            label_2=f"{result.field_id}_ir_epoch2",
+        )
+        result.spectral_result = spectral_result
+
+        # Apply NMS + WCS conversion (using W1 header, not optical)
+        candidates = detections_to_candidates(
+            spectral_result.patch_detections,
+            w1_hdr_dict,
+            spectral_result.grid_shape,
+        )
+        spectral_result.candidates = candidates
+
+        # Enrich detections with temperature + Planck classification
+        enriched: list[dict] = []
+        for i, det in enumerate(spectral_result.patch_detections):
+            r, c = det.patch_row, det.patch_col
+
+            temp_k = float(spectral_result.temperature_map[r, c])
+            temp_std = float(spectral_result.temperature_std_map[r, c])
+            planck_class = (
+                spectral_result.planck_classifications[i]
+                if i < len(spectral_result.planck_classifications)
+                else "uncertain"
+            )
+
+            # Coordinate conversion using W1 WCS
+            ra, dec = float("nan"), float("nan")
+            try:
+                from astroworld.imaging.synthetic_injection import (
+                    pixel_to_radec,
+                )
+                ra, dec = pixel_to_radec(
+                    det.pixel_x, det.pixel_y, w1_hdr_dict,
+                )
+            except Exception:
+                pass
+
+            enriched.append(
+                {
+                    "pixel_x": det.pixel_x,
+                    "pixel_y": det.pixel_y,
+                    "ra_deg": ra,
+                    "dec_deg": dec,
+                    "probability": det.probability,
+                    "temperature_k": temp_k,
+                    "temperature_std_k": temp_std,
+                    "planck_class": planck_class,
+                }
+            )
+
+        # ---- SNR photometric filter (IR band) ----------------------------
+        # In ir_only mode, measure SNR on W2 (or W1 fallback) instead of
+        # optical.  P9 at ~40 K is brightest in W2 (4.6 µm).
+        snr_image = w2 if w2 is not None else w1
+        snr_band_label = "W2" if w2 is not None else "W1"
+        snr_threshold = self.config.snr_min
+        n_before_snr = len(enriched)
+        if snr_threshold > 0:
+            snr_filtered = []
+            for cand in enriched:
+                snr = self._patch_snr(
+                    snr_image,
+                    cand["pixel_x"],
+                    cand["pixel_y"],
+                    aperture_r=self.config.snr_aperture_radius,
+                    annulus_inner=self.config.snr_annulus_inner,
+                    annulus_outer=self.config.snr_annulus_outer,
+                )
+                cand["ir_snr"] = round(snr, 2)
+                if snr >= snr_threshold:
+                    snr_filtered.append(cand)
+
+            n_rejected_snr = n_before_snr - len(snr_filtered)
+            if n_rejected_snr > 0 and self.config.verbose:
+                print(
+                    f"    [SNR filter] {n_rejected_snr}/{n_before_snr} "
+                    f"rejected ({snr_band_label} SNR < {snr_threshold:.1f})"
+                )
+            enriched = snr_filtered
+
+        # ---- Per-patch IR quality filter ----------------------------------
+        ps = self.config.patch_size
+        _, cube_h, cube_w = cube1.shape
+        min_frac = self.config.ir_min_valid_fraction
+        n_rejected_patch = 0
+
+        for cand in enriched:
+            cx, cy = cand["pixel_x"], cand["pixel_y"]
+            y0 = max(int(cy - ps / 2), 0)
+            x0 = max(int(cx - ps / 2), 0)
+            y1 = min(y0 + ps, cube_h)
+            x1 = min(x0 + ps, cube_w)
+
+            w1_patch = cube1[BAND_W1, y0:y1, x0:x1]
+            w2_patch = cube1[BAND_W2, y0:y1, x0:x1]
+            n_pixels = max(w1_patch.size, 1)
+
+            w1_valid = float(np.count_nonzero(w1_patch)) / n_pixels
+            w2_valid = float(np.count_nonzero(w2_patch)) / n_pixels
+
+            if w1_valid < min_frac and w2_valid < min_frac:
+                cand["ir_quality"] = "insufficient_ir_patch"
+                n_rejected_patch += 1
+            elif w1_valid < min_frac or w2_valid < min_frac:
+                cand["ir_quality"] = "partial_patch"
+            else:
+                cand["ir_quality"] = "full"
+
+        if n_rejected_patch > 0 and self.config.verbose:
+            print(
+                f"    [IR patch filter] {n_rejected_patch}/{len(enriched)} "
+                f"patches rejected (<{min_frac:.0%} valid IR pixels)"
+            )
+
+        # ---- Planck filter -----------------------------------------------
+        filtered = [
+            cand
+            for cand in enriched
+            if (
+                cand["planck_class"] in self.config.planck_classes_keep
+                and cand.get("ir_quality") != "insufficient_ir_patch"
+            )
+        ]
+
+        # Field-level IR quality (same logic as _stage3_spectral)
+        if not (result.has_w1 or result.has_w2):
+            for cand in filtered:
+                cand["planck_class"] = "insufficient_ir"
+            filtered = []
+            if self.config.verbose:
+                print(
+                    f"    [IR filter] No WISE data — "
+                    f"rejected {len(enriched)} detection(s)"
+                )
+
+        result.stage3_detections = len(spectral_result.patch_detections)
+        result.stage3_candidates = filtered
+        result.inference_time_sec += time.time() - t0
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Stage 3b: Dust Piercer (ir_only mode)
+    # ------------------------------------------------------------------
+
+    def _stage3b_dust_piercer(self, result: FieldResult) -> FieldResult:
+        """Run Dust Piercer as integrated validation for ir_only mode.
+
+        For each surviving candidate, runs WISE W2 morphology analysis
+        and NEOWISE multi-epoch proper motion search.  Retains only
+        POINT_MOVING and POINT_STATIC verdicts (rejects DIFFUSE, NO_SOURCE).
+
+        Relaxes the pointiness threshold for small (fallback) images
+        where the PSF may appear artificially broad.
+        """
+        from astroworld.imaging.dust_piercer import (
+            analyze_candidate,
+            classify_dust_piercer_verdict,
+        )
+
+        if not result.w2_path and not result.w1_path:
+            return result
+
+        t0 = time.time()
+
+        # Load W2 for morphology (preferred) or W1 as fallback
+        w2_path = result.w2_path or result.w1_path
+        w2_img, w2_hdr = load_fits_image(Path(w2_path))
+
+        # Detect small (fallback) images where PSF analysis is degraded
+        is_small_image = min(w2_img.shape) < 300
+
+        enriched: list[dict] = []
+        verdicts: dict[str, int] = {}
+
+        for cand in result.stage3_candidates:
+            try:
+                dp_result = analyze_candidate(
+                    cand["ra_deg"],
+                    cand["dec_deg"],
+                    w2_img,
+                    dict(w2_hdr) if hasattr(w2_hdr, "items") else w2_hdr,
+                    rate_limit_sec=self.config.rate_limit_sec,
+                    skip_neowise=False,
+                )
+
+                verdict = dp_result.verdict
+                cand["dp_verdict"] = verdict
+                cand["dp_confidence"] = dp_result.confidence
+
+                if dp_result.morphology:
+                    cand["dp_pointiness"] = dp_result.morphology.pointiness
+                    cand["dp_snr"] = dp_result.morphology.snr
+
+                if dp_result.proper_motion:
+                    cand["dp_pm_arcsec_yr"] = (
+                        dp_result.proper_motion.mu_total_arcsec_yr
+                    )
+                    cand["dp_pm_significance"] = (
+                        dp_result.proper_motion.pm_significance
+                    )
+
+                # Relaxed pointiness for small (fallback) images:
+                # Override DIFFUSE → POINT_STATIC if pointiness exceeds
+                # the relaxed threshold and image is small
+                if (
+                    is_small_image
+                    and verdict == "DIFFUSE"
+                    and dp_result.morphology
+                    and dp_result.morphology.pointiness
+                    >= self.config.dp_pointiness_threshold
+                ):
+                    verdict = "POINT_STATIC"
+                    cand["dp_verdict"] = verdict
+                    cand["dp_verdict_note"] = "relaxed_small_image"
+
+                verdicts[verdict] = verdicts.get(verdict, 0) + 1
+
+                # Keep only point sources (reject DIFFUSE, NO_SOURCE)
+                if verdict in ("POINT_MOVING", "POINT_STATIC"):
+                    enriched.append(cand)
+
+            except Exception as e:
+                cand["dp_verdict"] = "ERROR"
+                cand["dp_error"] = str(e)
+                verdicts["ERROR"] = verdicts.get("ERROR", 0) + 1
+                enriched.append(cand)  # Keep on error — manual review
+
+        n_rejected = len(result.stage3_candidates) - len(enriched)
+        if self.config.verbose and n_rejected > 0:
+            print(
+                f"    [Dust Piercer] {n_rejected}/"
+                f"{len(result.stage3_candidates)} rejected: "
+                f"{verdicts}"
+            )
+
+        result.stage3b_dp_analyzed = len(result.stage3_candidates)
+        result.stage3b_dp_verdicts = verdicts
+        result.stage3_candidates = enriched
+        result.inference_time_sec += time.time() - t0
+
+        return result
+
+    # ------------------------------------------------------------------
     # Stage 4: Kinematic filter
     # ------------------------------------------------------------------
 
@@ -834,20 +1195,22 @@ class ObservatoryPipeline:
         heatmap_dir = output_dir / "heatmaps"
 
         for fr in summary.field_results:
+            # Use optical as background, or W1 in ir_only mode
+            bg_path = fr.optical_path or fr.w1_path
             if (
                 fr.spectral_result is not None
                 and len(fr.final_candidates) > 0
-                and fr.optical_path is not None
+                and bg_path is not None
             ):
                 heatmap_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    optical_img, _ = load_fits_image(Path(fr.optical_path))
+                    bg_img, _ = load_fits_image(Path(bg_path))
                     heatmap_path = (
                         heatmap_dir / f"{fr.field_id}_heatmap.png"
                     )
                     plot_heatmap(
                         fr.spectral_result,
-                        optical_img,
+                        bg_img,
                         heatmap_path,
                         title=(
                             f"{fr.field_id} | "

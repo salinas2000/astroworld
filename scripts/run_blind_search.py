@@ -327,6 +327,11 @@ def parse_args() -> argparse.Namespace:
         "--resume-from", type=int, default=0,
         help="Resume from field N (skip first N fields)",
     )
+    parser.add_argument(
+        "--ir-only", action="store_true",
+        help="IR-only mode: skip optical, use WISE W1+W2 + Dust Piercer. "
+             "For targets invisible in optical (P9 at ~25 mag).",
+    )
 
     return parser.parse_args()
 
@@ -422,8 +427,9 @@ def main() -> None:
     if not args.planck_strict:
         planck_keep.append("cold_object")
 
+    pipeline_mode = "ir_only" if getattr(args, "ir_only", False) else "spectral_only"
     config = PipelineConfig(
-        mode="spectral_only",
+        mode=pipeline_mode,
         spectral_threshold=args.spectral_threshold,
         mc_samples=args.mc_samples,
         planck_classes_keep=planck_keep,

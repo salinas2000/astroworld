@@ -566,8 +566,12 @@ class P9Survey:
         # Load pipeline (lazy)
         if self.pipeline is None:
             logger.info("  Loading spectral model...")
+            pipeline_mode = (
+                "ir_only" if getattr(self.args, "ir_only", False)
+                else "spectral_only"
+            )
             config = PipelineConfig(
-                mode="spectral_only",
+                mode=pipeline_mode,
                 spectral_threshold=self.args.spectral_threshold,
                 mc_samples=self.args.mc_samples,
                 planck_classes_keep=["p9_candidate"],
@@ -1080,15 +1084,22 @@ class P9Survey:
         if self.args.scan_only:
             return ["scan"]
         if self.args.downstream_only:
-            return ["crossmatch", "blink", "dust_piercer"]
-        if self.args.stages:
+            stages = ["crossmatch", "blink", "dust_piercer"]
+        elif self.args.stages:
             requested = [s.strip() for s in self.args.stages.split(",")]
             for s in requested:
                 if s not in ALL_STAGES:
                     logger.error("Unknown stage: %s", s)
                     sys.exit(1)
-            return requested
-        return list(ALL_STAGES)
+            stages = requested
+        else:
+            stages = list(ALL_STAGES)
+
+        # IR-only mode: skip BLINK (requires optical DSS2 + PS1 epochs)
+        if getattr(self.args, "ir_only", False) and "blink" in stages:
+            stages.remove("blink")
+
+        return stages
 
     def _print_banner(
         self,
@@ -1097,10 +1108,11 @@ class P9Survey:
         stages: list[str],
     ) -> None:
         """Print survey header."""
+        ir_tag = " [IR-ONLY]" if getattr(self.args, "ir_only", False) else ""
         logger.info("")
         logger.info("=" * 65)
-        logger.info("  P9 SURVEY ORCHESTRATOR — Phase 20")
-        logger.info("  Automated Pipeline: Scan -> Crossmatch -> Blink -> Dust Piercer")
+        logger.info("  P9 SURVEY ORCHESTRATOR — Phase 20%s", ir_tag)
+        logger.info("  Automated Pipeline: %s", " -> ".join(stages))
         logger.info("=" * 65)
         logger.info("  Region:      %s — %s", self.region_name, self.description)
         logger.info(
@@ -1304,6 +1316,11 @@ def parse_args() -> argparse.Namespace:
         help="Only blink candidates with T <= this (K)",
     )
     parser.add_argument("--no-cards", action="store_true")
+    parser.add_argument(
+        "--ir-only", action="store_true",
+        help="IR-only mode: skip optical, use WISE W1+W2 + Dust Piercer. "
+             "For targets invisible in optical (P9 at ~25 mag).",
+    )
 
     # Output
     parser.add_argument("--output-dir", type=Path, default=None)

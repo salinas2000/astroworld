@@ -71,6 +71,7 @@ def _write_synthetic_fits(
     ra: float = 180.0,
     dec: float = 30.0,
     fill_zeros: bool = False,
+    pixel_scale_arcsec: float = 1.7,
 ) -> None:
     """Write a minimal synthetic FITS file for testing.
 
@@ -78,6 +79,8 @@ def _write_synthetic_fits(
     ----------
     fill_zeros : bool
         If True, write all-zero data (simulates HTTP 404 / empty tile).
+    pixel_scale_arcsec : float
+        Pixel scale in arcsec (1.7 for DSS2, 2.75 for WISE).
     """
     from astropy.io import fits
 
@@ -96,8 +99,8 @@ def _write_synthetic_fits(
     hdr["CRVAL2"] = dec
     hdr["CRPIX1"] = (nx + 1) / 2.0
     hdr["CRPIX2"] = (ny + 1) / 2.0
-    hdr["CDELT1"] = -1.7 / 3600.0
-    hdr["CDELT2"] = 1.7 / 3600.0
+    hdr["CDELT1"] = -pixel_scale_arcsec / 3600.0
+    hdr["CDELT2"] = pixel_scale_arcsec / 3600.0
     hdr["CUNIT1"] = "deg"
     hdr["CUNIT2"] = "deg"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,8 +129,13 @@ def _mock_download_factory(tmp_path: Path):
             fname = f"field_ra{ra_deg:07.3f}_dec{dec_str}.fits"
             path = tmp_path / survey_dir / fname
             if not path.exists():
+                # Use WISE pixel scale for IR surveys
+                pixel_scale = (
+                    2.75 if "wise" in survey.lower() else 1.7
+                )
                 _write_synthetic_fits(
-                    path, nx=pixels, ny=pixels, ra=ra_deg, dec=dec_deg
+                    path, nx=pixels, ny=pixels, ra=ra_deg, dec=dec_deg,
+                    pixel_scale_arcsec=pixel_scale,
                 )
             paths.append(path)
         return paths
@@ -1156,3 +1164,210 @@ class TestObservatorySummary:
         text = summary_path.read_text()
         assert "Observatory Pipeline" in text
         assert "spectral_only" in text
+
+
+# ---------------------------------------------------------------------------
+# TestIROnlyMode — Phase 21: IR-only pipeline mode
+# ---------------------------------------------------------------------------
+
+
+@requires_torch
+class TestIROnlyMode:
+    """Tests for ir_only pipeline mode (no optical dependency)."""
+
+    def test_config_accepts_ir_only(self):
+        """PipelineConfig accepts ir_only mode."""
+        from astroworld.ml.pipeline import PipelineConfig
+
+        cfg = PipelineConfig(mode="ir_only")
+        assert cfg.mode == "ir_only"
+        assert cfg.ir_snr_band == "W2"
+        assert cfg.dp_pointiness_threshold == 0.20
+
+    def test_field_result_dp_fields(self):
+        """FieldResult has Stage 3b Dust Piercer fields."""
+        from astroworld.ml.pipeline import FieldResult
+
+        fr = FieldResult(field_id="test", ra_deg=0.0, dec_deg=0.0)
+        assert fr.stage3b_dp_analyzed == 0
+        assert fr.stage3b_dp_verdicts == {}
+
+    def test_ir_only_skips_optical_download(self, tmp_path):
+        """ir_only mode does not download DSS2 Red."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.5, mc_samples=1, device="cpu",
+        )
+        config = PipelineConfig(
+            mode="ir_only",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        downloaded_surveys = []
+
+        def _capture_download(
+            ra_deg, dec_deg, surveys=None, **kwargs
+        ):
+            downloaded_surveys.extend(surveys or [])
+            return _mock_download_factory(tmp_path)(
+                ra_deg, dec_deg, surveys=surveys, **kwargs
+            )
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_capture_download,
+        ):
+            pipeline.process_field(180.0, 30.0)
+
+        # DSS2 Red should NOT be in downloaded surveys
+        assert "DSS2 Red" not in downloaded_surveys
+        # WISE surveys should be present
+        assert "WISE 3.4" in downloaded_surveys
+        assert "WISE 4.6" in downloaded_surveys
+
+    def test_ir_only_no_w1_gives_error(self, tmp_path):
+        """ir_only mode with no W1 returns error."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.5, mc_samples=1, device="cpu",
+        )
+        config = PipelineConfig(
+            mode="ir_only",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        # Mock that returns empty list (no downloads)
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            return_value=[],
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        assert result.error == "No W1 image available"
+
+    def test_ir_only_builds_ir_cube(self, tmp_path):
+        """ir_only mode builds cube from W1/W2 without optical."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.5, mc_samples=1, device="cpu",
+        )
+        config = PipelineConfig(
+            mode="ir_only",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_factory(tmp_path),
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        # No error — the pipeline should not crash on ir_only
+        assert result.error is None
+        # optical_path should be None (no DSS2 downloaded)
+        assert result.optical_path is None
+        # W1 should be present
+        assert result.w1_path is not None
+        assert result.has_w1 is True
+
+    def test_ir_only_full_pipeline(self, tmp_path):
+        """Full ir_only pipeline processes a field end-to-end."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.5, mc_samples=1, device="cpu",
+        )
+        output_dir = tmp_path / "results"
+        config = PipelineConfig(
+            mode="ir_only",
+            data_dir=tmp_path,
+            output_dir=output_dir,
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_factory(tmp_path),
+        ):
+            summary = pipeline.run(fields=[(180.0, 30.0)])
+
+        assert summary.n_fields_processed == 1
+        assert summary.n_fields_errored == 0
+
+    def test_existing_spectral_only_unchanged(self, tmp_path):
+        """spectral_only mode still works exactly as before."""
+        from astroworld.ml.pipeline import (
+            ObservatoryPipeline,
+            PipelineConfig,
+        )
+        from astroworld.ml.spectral_inference import SpectralSearcher
+        from astroworld.ml.spectral_model import SpectralSiameseNet
+
+        model = SpectralSiameseNet(feature_dim=64, num_heads=2, dropout=0.1)
+        searcher = SpectralSearcher(
+            model, patch_size=32, overlap=0,
+            threshold=0.5, mc_samples=1, device="cpu",
+        )
+        config = PipelineConfig(
+            mode="spectral_only",
+            data_dir=tmp_path,
+            output_dir=tmp_path / "results",
+            download_pixels=64,
+            verbose=False,
+        )
+        pipeline = ObservatoryPipeline(config, searcher)
+
+        with patch(
+            "astroworld.ml.pipeline.download_field",
+            side_effect=_mock_download_factory(tmp_path),
+        ):
+            result = pipeline.process_field(180.0, 30.0)
+
+        # In spectral_only, optical_path SHOULD be set
+        assert result.optical_path is not None
+        assert result.error is None

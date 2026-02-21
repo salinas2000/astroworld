@@ -4,19 +4,23 @@ Spectral cube assembly for multi-survey image fusion.
 Combines optical (DSS2/Pan-STARRS), infrared (WISE W1/W2), uncertainty,
 and temporal gradient channels into a 5-channel cube per epoch.
 
-Channel layout:
-  C0: Optical band (DSS2 Red, Pan-STARRS r, etc.)
+Two assembly modes:
+  ``build_spectral_cube``  — Optical-anchored (default): optical as C0 reference.
+  ``build_ir_cube``        — IR-only: W1 as C0 reference, no optical needed.
+
+Channel layout (both modes):
+  C0: Reference band (optical or W1 in ir_only mode)
   C1: WISE W1 (3.4 um) — thermal emission
   C2: WISE W2 (4.6 um) — thermal confirmation
   C3: Uncertainty map (inverse background variance)
-  C4: Temporal gradient (inter-epoch optical difference / delta_t)
+  C4: Temporal gradient (inter-epoch difference / delta_t, zeros in ir_only)
 
-WISE images (2.75 arcsec/px) are reprojected to the optical WCS
-(typically 1.7 arcsec/px for DSS2) using ``reproject_interp``.
+WISE images (2.75 arcsec/px) are reprojected to the reference WCS
+using ``reproject_interp``.
 
 Cube assembly is the slowest step due to WCS reprojection.  Use
-``build_spectral_cube_cached()`` for persistent on-disk caching
-that avoids re-alignment between training runs.
+``build_spectral_cube_cached()`` / ``build_ir_cube_cached()`` for
+persistent on-disk caching that avoids re-alignment between runs.
 
 Physical utilities:
   - Planck blackbody flux ratio (W1/W2) for temperature estimation
@@ -122,6 +126,146 @@ def build_spectral_cube(
     # (requires the second epoch cube)
 
     return cube
+
+
+# ---------------------------------------------------------------------------
+# IR-only cube assembly
+# ---------------------------------------------------------------------------
+
+def build_ir_cube(
+    w1_image: np.ndarray,
+    w1_header: dict,
+    w2_image: np.ndarray | None = None,
+    w2_header: dict | None = None,
+    target_shape: tuple[int, int] | None = None,
+) -> np.ndarray:
+    """Assemble a 5-channel spectral cube from IR-only images.
+
+    For IR-only detection mode: uses WISE W1 as the spatial reference
+    frame (instead of optical).  Channel layout matches
+    ``build_spectral_cube`` for SSTF model compatibility:
+
+    * C0 (BAND_OPTICAL) — W1 image (broadband reference for encoder)
+    * C1 (BAND_W1)      — W1 3.4 µm (thermal emission)
+    * C2 (BAND_W2)      — W2 4.6 µm reprojected to W1 WCS (or zeros)
+    * C3 (BAND_UNCERTAINTY) — Inverse-variance from W1 background
+    * C4 (BAND_TEMPORAL) — Zeros (single-epoch IR, no motion baseline)
+
+    Parameters
+    ----------
+    w1_image : 2D array
+        WISE W1 image (reference WCS frame, typically 2.75 arcsec/px).
+    w1_header : dict
+        FITS header with WCS for the W1 image.
+    w2_image : 2D array or None
+        WISE W2 image (may differ in shape/WCS).
+    w2_header : dict or None
+        FITS header with WCS for the W2 image.
+    target_shape : tuple of int, optional
+        Output spatial shape ``(ny, nx)``.  Defaults to W1 image shape.
+
+    Returns
+    -------
+    np.ndarray of shape ``(5, H, W)``, float32
+        IR-only spectral cube.
+    """
+    if target_shape is None:
+        target_shape = w1_image.shape
+
+    ny, nx = target_shape
+    cube = np.zeros((NUM_CHANNELS, ny, nx), dtype=np.float32)
+
+    # C0: W1 as broadband reference (replaces optical channel)
+    cube[BAND_OPTICAL] = _match_shape(w1_image, target_shape)
+
+    # C1: WISE W1 (identical to C0 in IR-only mode)
+    cube[BAND_W1] = _match_shape(w1_image, target_shape)
+
+    # C2: WISE W2 — reproject to W1 WCS if available
+    if w2_image is not None and w2_header is not None:
+        cube[BAND_W2] = _reproject_to_reference(
+            w2_image, w2_header,
+            w1_header, target_shape,
+        )
+
+    # C3: Uncertainty map from W1 background
+    unc_full = compute_uncertainty_map(w1_image)
+    cube[BAND_UNCERTAINTY] = _match_shape(unc_full, target_shape)
+
+    # C4: Temporal gradient — zeros (no multi-epoch IR baseline)
+
+    return cube
+
+
+def build_ir_cube_cached(
+    w1_image: np.ndarray,
+    w1_header: dict,
+    w2_image: np.ndarray | None = None,
+    w2_header: dict | None = None,
+    target_shape: tuple[int, int] | None = None,
+    cache_dir: Path = Path("data/spectral_cache"),
+    cache_key: str | None = None,
+) -> np.ndarray:
+    """Build IR-only spectral cube with persistent on-disk cache.
+
+    Same caching strategy as ``build_spectral_cube_cached`` but for
+    the IR-only cube.  Cache keys are derived from W1 header
+    coordinates + target shape.
+
+    Parameters
+    ----------
+    cache_dir : Path
+        Directory for cached ``.npy`` files.
+    cache_key : str, optional
+        Explicit cache key.  If None, computed from ``w1_header``.
+    Other parameters : same as ``build_ir_cube``.
+
+    Returns
+    -------
+    np.ndarray of shape ``(5, H, W)``, float32
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if cache_key is None:
+        cache_key = _compute_cache_key(
+            w1_header, target_shape or w1_image.shape,
+            None,  # no target_pixel_scale override for IR
+        )
+
+    cache_path = cache_dir / f"ircube_{cache_key}.npy"
+
+    if cache_path.exists():
+        return np.load(str(cache_path))
+
+    cube = build_ir_cube(
+        w1_image, w1_header,
+        w2_image, w2_header,
+        target_shape,
+    )
+
+    np.save(str(cache_path), cube)
+    return cube
+
+
+def _reproject_to_reference(
+    ir_image: np.ndarray,
+    ir_header: dict,
+    ref_header: dict,
+    target_shape: tuple[int, int],
+    target_pixel_scale_arcsec: float | None = None,
+) -> np.ndarray:
+    """Reproject an IR image to a reference WCS frame.
+
+    Thin wrapper around ``_reproject_to_optical`` — identical logic,
+    but named to avoid confusion in IR-only mode where the reference
+    frame is WISE W1 (not optical).
+    """
+    return _reproject_to_optical(
+        ir_image, ir_header,
+        ref_header, target_shape,
+        target_pixel_scale_arcsec,
+    )
 
 
 def build_spectral_cube_cached(

@@ -186,6 +186,89 @@ class TestBuildSpectralCube:
             np.testing.assert_array_equal(cube1, cube2)
 
 
+class TestBuildIRCube:
+    """Tests for build_ir_cube() — IR-only spectral cube assembly."""
+
+    def test_ir_cube_shape(self):
+        """IR cube has shape (5, H, W) matching W1 image."""
+        w1 = _make_noisy_image((200, 200))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=200, ny=200)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header)
+        assert cube.shape == (NUM_CHANNELS, 200, 200)
+        assert cube.dtype == np.float32
+
+    def test_w1_in_c0_and_c1(self):
+        """W1 populates both C0 (reference) and C1 (thermal)."""
+        w1 = _make_noisy_image((64, 64))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header)
+        assert cube[BAND_OPTICAL].std() > 0  # C0 = W1
+        assert cube[BAND_W1].std() > 0       # C1 = W1
+        np.testing.assert_array_equal(cube[BAND_OPTICAL], cube[BAND_W1])
+
+    def test_w2_in_c2(self):
+        """W2 image is placed in channel 2."""
+        w1 = _make_noisy_image((64, 64), seed=1)
+        w2 = _make_noisy_image((64, 64), seed=2)
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header, w2, header)
+        assert cube[BAND_W2].std() > 0
+
+    def test_uncertainty_from_w1(self):
+        """Uncertainty map computed from W1 background."""
+        w1 = _make_noisy_image((64, 64))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header)
+        assert cube[BAND_UNCERTAINTY].sum() > 0
+
+    def test_temporal_is_zeros(self):
+        """Temporal gradient channel is zeros (single-epoch IR)."""
+        w1 = _make_noisy_image((64, 64))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header)
+        assert np.allclose(cube[BAND_TEMPORAL], 0.0)
+
+    def test_no_w2_fills_zeros(self):
+        """Without W2, channel 2 is all zeros."""
+        w1 = _make_noisy_image((64, 64))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import build_ir_cube
+
+        cube = build_ir_cube(w1, header)
+        assert cube[BAND_W2].sum() == 0
+
+    def test_ir_cube_cached(self, tmp_path):
+        """Cached IR cube matches direct build."""
+        w1 = _make_noisy_image((64, 64))
+        header = _make_wcs_header(pixel_scale_arcsec=2.75, nx=64, ny=64)
+        from astroworld.imaging.spectral_cube import (
+            build_ir_cube,
+            build_ir_cube_cached,
+        )
+
+        cube1 = build_ir_cube(w1, header)
+        cube2 = build_ir_cube_cached(
+            w1, header, cache_dir=tmp_path, cache_key="ir_test",
+        )
+        np.testing.assert_array_equal(cube1, cube2)
+
+        # Second call should load from cache
+        cube3 = build_ir_cube_cached(
+            w1, header, cache_dir=tmp_path, cache_key="ir_test",
+        )
+        np.testing.assert_array_equal(cube1, cube3)
+
+
 class TestUncertaintyMap:
     """Tests for compute_uncertainty_map()."""
 
