@@ -74,6 +74,22 @@ from astroworld.imaging.time_machine import (
     make_blink_card,
 )
 
+from astroworld.imaging.dust_piercer import (
+    MorphologyResult,
+    NEOWISEDetection,
+    ProperMotionResult,
+    DustPiercerResult,
+    fit_gaussian_2d,
+    classify_morphology,
+    query_neowise_tap,
+    group_by_epoch,
+    fit_proper_motion,
+    classify_dust_piercer_verdict,
+    analyze_candidate,
+    analyze_candidates,
+    make_dust_piercer_card,
+)
+
 from astroworld.imaging.spectral_cube import (
     build_spectral_cube,
     build_spectral_cube_cached,
@@ -129,6 +145,20 @@ __all__ = [
     "blink_candidate",
     "blink_candidates",
     "make_blink_card",
+    # Dust Piercer (IR morphology + NEOWISE PM)
+    "MorphologyResult",
+    "NEOWISEDetection",
+    "ProperMotionResult",
+    "DustPiercerResult",
+    "fit_gaussian_2d",
+    "classify_morphology",
+    "query_neowise_tap",
+    "group_by_epoch",
+    "fit_proper_motion",
+    "classify_dust_piercer_verdict",
+    "analyze_candidate",
+    "analyze_candidates",
+    "make_dust_piercer_card",
     # Spectral cube
     "build_spectral_cube",
     "build_spectral_cube_cached",
