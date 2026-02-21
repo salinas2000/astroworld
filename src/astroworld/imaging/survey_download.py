@@ -54,6 +54,51 @@ def _survey_to_dir(survey_name: str) -> str:
     )
 
 
+def _skyview_get_with_fallback(
+    coord: "SkyCoord",
+    survey: str,
+    pixels: int,
+    radius_arcmin: float,
+    max_retries: int = 3,
+) -> Optional[list]:
+    """Try SkyView download with adaptive parameter fallback.
+
+    SkyView's WISE tile mosaic engine sometimes fails (HTTP 404) for
+    certain radius/pixel combinations at specific sky positions.  When
+    the primary request fails we retry with progressively smaller
+    cutout parameters that are more likely to fit within a single WISE
+    tile, avoiding the problematic server-side mosaic.
+
+    Returns
+    -------
+    HDU list on success, None on failure.
+    """
+    from astroquery.skyview import SkyView
+
+    # Primary attempt + fallback parameter ladders (pixels, radius_arcmin)
+    attempts = [
+        (pixels, radius_arcmin),           # original request
+        (pixels, radius_arcmin * 0.6),     # smaller radius
+        (300, min(radius_arcmin, 3.0)),    # reduced resolution + radius
+        (200, 2.0),                        # minimal — fits one WISE tile
+    ]
+
+    for px, rad in attempts[:max_retries + 1]:
+        try:
+            hdu_list = SkyView.get_images(
+                position=coord,
+                survey=[survey],
+                pixels=px,
+                radius=rad * u.arcmin,
+            )
+            if hdu_list and len(hdu_list) > 0:
+                return hdu_list
+        except Exception:
+            time.sleep(0.5)
+
+    return None
+
+
 def download_field(
     ra_deg: float,
     dec_deg: float,
@@ -117,12 +162,28 @@ def download_field(
                 print(f"  [done] {survey}: {filepath.name} "
                       f"({hdu_list[0][0].data.shape})")
                 downloaded.append(filepath)
-            else:
-                print(f"  [warn] {survey}: no data for "
-                      f"RA={ra_deg:.3f}, Dec={dec_deg:.3f}")
+                time.sleep(rate_limit_sec)
+                continue
 
-        except Exception as e:
-            print(f"  [error] {survey}: {e}")
+        except Exception:
+            pass
+
+        # --- Fallback: adaptive parameter retry for WISE surveys ---
+        if "WISE" in survey:
+            hdu_list = _skyview_get_with_fallback(
+                coord, survey, pixels, radius_arcmin,
+            )
+            if hdu_list is not None:
+                hdu_list[0].writeto(str(filepath), overwrite=True)
+                shape = hdu_list[0][0].data.shape
+                print(f"  [done] {survey}: {filepath.name} "
+                      f"({shape}) (fallback)")
+                downloaded.append(filepath)
+                time.sleep(rate_limit_sec)
+                continue
+
+        print(f"  [error] {survey}: no data for "
+              f"RA={ra_deg:.3f}, Dec={dec_deg:.3f}")
 
         # Rate limiting (be nice to servers)
         time.sleep(rate_limit_sec)
